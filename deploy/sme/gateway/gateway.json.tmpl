@@ -1,0 +1,20 @@
+{
+  "env": "production",
+  "http_addr": ":8080",
+  "postgres_dsn": "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable",
+  "wasabi": {
+    "endpoint": "${WASABI_ENDPOINT}",
+    "region": "${WASABI_REGION}",
+    "bucket": "${WASABI_BUCKET}",
+    "access_key": "${WASABI_ACCESS_KEY}",
+    "secret_key": "${WASABI_SECRET_KEY}",
+    "use_path_style": true
+  },
+  "cache": {
+    "type": "disk",
+    "disk_root_path": "/var/lib/kdrive/cache",
+    "max_bytes": ${KDRIVE_CACHE_MAX_BYTES:-429496729600}
+  },
+  "wasabi_circuit_breaker_enabled": ${KDRIVE_CIRCUIT_BREAKER_ENABLED:-false},
+  "wasabi_circuit_breaker_threshold": ${KDRIVE_CIRCUIT_BREAKER_THRESHOLD:-10}
+}

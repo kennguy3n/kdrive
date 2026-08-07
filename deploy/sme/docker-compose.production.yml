@@ -1,0 +1,145 @@
+# KChat Drive — single-VM-pool production deployment.
+#
+# This compose file runs the full SME single-pool stack on one Linode
+# VM: Traefik (edge proxy / TLS), two drive-gateway replicas, one
+# Postgres instance, and one drive-worker. It mirrors the
+# zk-object-fabric deploy/sme/docker-compose.production.yml shape,
+# adapted for KChat Drive's Go layout.
+#
+# Secrets are read from the sibling .env file (copy .env.example to
+# .env and fill in the values). The entrypoint script renders the
+# gateway/worker config templates with envsubst at container start so
+# secrets never land in the image.
+#
+# Usage:
+#   cp .env.example .env  # fill in Wasabi + Postgres credentials
+#   docker compose -f deploy/sme/docker-compose.production.yml up -d
+#   # The gateway auto-migrates the schema on startup; no manual psql step.
+#   ./deploy/sme/backup.sh  # nightly backup (add to host cron)
+
+services:
+  traefik:
+    image: traefik:v3.2
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL:?LETSENCRYPT_EMAIL must be set}
+      - --certificatesresolvers.le.acme.storage=/acme/acme.json
+      - --certificatesresolvers.le.acme.tlschallenge=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/acme
+    restart: unless-stopped
+
+  gateway-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["drive-gateway", "-config", "/etc/kdrive/gateway.json"]
+    environment:
+      - DRIVE_GATEWAY_CONFIG=/etc/kdrive/gateway.json
+    volumes:
+      - gateway-1-cache:/var/lib/kdrive/cache
+      - ./gateway/gateway.json.tmpl:/etc/kdrive/gateway.json.tmpl:ro
+    entrypoint: ["/bin/sh", "-c", "envsubst < /etc/kdrive/gateway.json.tmpl > /etc/kdrive/gateway.json && exec drive-gateway -config /etc/kdrive/gateway.json"]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.kdrive-gateway.rule=Host(`${KDRIVE_HOST:?KDRIVE_HOST must be set}`)
+      - traefik.http.routers.kdrive-gateway.entrypoints=websecure
+      - traefik.http.routers.kdrive-gateway.tls.certresolver=le
+      - traefik.http.services.kdrive-gateway.loadbalancer.server.port=8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gateway-2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["drive-gateway", "-config", "/etc/kdrive/gateway.json"]
+    environment:
+      - DRIVE_GATEWAY_CONFIG=/etc/kdrive/gateway.json
+    volumes:
+      - gateway-2-cache:/var/lib/kdrive/cache
+      - ./gateway/gateway.json.tmpl:/etc/kdrive/gateway.json.tmpl:ro
+    entrypoint: ["/bin/sh", "-c", "envsubst < /etc/kdrive/gateway.json.tmpl > /etc/kdrive/gateway.json && exec drive-gateway -config /etc/kdrive/gateway.json"]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.kdrive-gateway.rule=Host(`${KDRIVE_HOST:?KDRIVE_HOST must be set}`)
+      - traefik.http.routers.kdrive-gateway.entrypoints=websecure
+      - traefik.http.routers.kdrive-gateway.tls.certresolver=le
+      - traefik.http.services.kdrive-gateway.loadbalancer.server.port=8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["drive-worker", "-config", "/etc/kdrive/worker.json"]
+    environment:
+      - DRIVE_WORKER_CONFIG=/etc/kdrive/worker.json
+    volumes:
+      - ./worker/worker.json.tmpl:/etc/kdrive/worker.json.tmpl:ro
+    entrypoint: ["/bin/sh", "-c", "envsubst < /etc/kdrive/worker.json.tmpl > /etc/kdrive/worker.json && exec drive-worker -config /etc/kdrive/worker.json"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      - POSTGRES_DB=${POSTGRES_DB:-kdrive}
+      # WAL archiving for PITR. Archive WAL segments to a local
+      # volume; the backup.sh script syncs them to Wasabi nightly.
+      # This enables point-in-time recovery with ~15 min RPO
+      # (archive_timeout forces a segment switch every 15 minutes
+      # even if WAL traffic is low).
+      - POSTGRES_INITDB_ARGS=--wal-segsize=64
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_command=cp %p /var/lib/postgresql/wal-archive/%f"
+      - "-c"
+      - "archive_timeout=900"  # 15 minutes
+      - "-c"
+      - "max_wal_senders=3"
+      - "-c"
+      - "checkpoint_timeout=300"  # 5 minutes
+      - "-c"
+      - "max_wal_size=4GB"
+      - "-c"
+      - "min_wal_size=1GB"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - postgres-wal-archive:/var/lib/postgresql/wal-archive
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-kdrive}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  traefik-acme:
+  gateway-1-cache:
+  gateway-2-cache:
+  postgres-data:
+  postgres-wal-archive:

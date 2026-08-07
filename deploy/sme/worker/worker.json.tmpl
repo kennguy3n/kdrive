@@ -1,0 +1,26 @@
+{
+  "env": "production",
+  "postgres_dsn": "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable",
+  "wasabi": {
+    "endpoint": "${WASABI_ENDPOINT}",
+    "region": "${WASABI_REGION}",
+    "bucket": "${WASABI_BUCKET}",
+    "access_key": "${WASABI_ACCESS_KEY}",
+    "secret_key": "${WASABI_SECRET_KEY}",
+    "use_path_style": true
+  },
+  "cache": {
+    "type": "memory",
+    "max_bytes": 268435456
+  },
+  "backup_cron": "${KDRIVE_BACKUP_CRON:-17 3 * * *}",
+  "backup_retention_days": ${KDRIVE_BACKUP_RETENTION_DAYS:-14},
+  "promote_interval_ms": ${KDRIVE_PROMOTE_INTERVAL_MS:-30000},
+  "promote_batch_size": ${KDRIVE_PROMOTE_BATCH_SIZE:-100},
+  "promote_parallelism": ${KDRIVE_PROMOTE_PARALLELISM:-4},
+  "repair_interval_ms": ${KDRIVE_REPAIR_INTERVAL_MS:-300000},
+  "repair_sample_count": ${KDRIVE_REPAIR_SAMPLE_COUNT:-10},
+  "queue_depth_alert": ${KDRIVE_QUEUE_DEPTH_ALERT:-1000},
+  "wasabi_circuit_breaker_enabled": ${KDRIVE_CIRCUIT_BREAKER_ENABLED:-false},
+  "wasabi_circuit_breaker_threshold": ${KDRIVE_CIRCUIT_BREAKER_THRESHOLD:-10}
+}

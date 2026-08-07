@@ -1,0 +1,46 @@
+# KChat Drive — dev stack.
+#
+# Runs Postgres + a single drive-gateway in dev mode (local_fs_dev
+# adapter, no Wasabi credentials needed). Use this for local
+# development and CI.
+#
+# Usage:
+#   docker compose -f deploy/dev/docker-compose.yml up -d
+#   docker compose -f deploy/dev/docker-compose.yml exec -T postgres \
+#       psql -U postgres kdrive < deploy/migrations/001_init.sql
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=kdrive
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-dev-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d kdrive"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["drive-gateway", "-addr", ":8080"]
+    environment:
+      - DRIVE_GATEWAY_CONFIG=
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - gateway-dev-cache:/var/lib/kdrive/cache
+
+volumes:
+  postgres-dev-data:
+  gateway-dev-cache:
