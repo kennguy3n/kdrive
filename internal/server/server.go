@@ -130,7 +130,27 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("/healthz", g.handleHealthz)
 	mux.HandleFunc("/readyz", g.handleReadyz)
 	mux.HandleFunc("/metrics", g.handleMetrics)
-	return mux
+
+	// Register drive demo API routes when Postgres is available.
+	if g.metaDB != nil {
+		demo := newDemoAPI(g)
+		demo.registerDemoRoutes(mux)
+	}
+
+	// Wrap with CORS/COOP/COEP headers for the web sample.
+	return withWebHeaders(mux)
+}
+
+// withWebHeaders adds CORS, COOP, and COEP headers required for the
+// React web sample (cross-origin isolation for threaded WASM).
+func withWebHeaders(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Cross-Origin Opener Policy + Embedder Policy for SharedWorker
+		// + threaded WASM (plan §D.1).
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
+		h.ServeHTTP(w, r)
+	})
 }
 
 func (g *Gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {

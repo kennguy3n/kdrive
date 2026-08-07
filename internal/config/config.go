@@ -269,8 +269,9 @@ func validateAddr(addr string) error {
 
 func devGatewayConfig() *GatewayConfig {
 	return &GatewayConfig{
-		Env:      "dev",
-		HTTPAddr: ":8080",
+		Env:         "dev",
+		HTTPAddr:    ":8080",
+		PostgresDSN: "postgres://postgres:postgres@localhost:5432/kdrive?sslmode=disable",
 		Cache: CacheConfig{
 			Type:     "memory",
 			MaxBytes: 256 * 1024 * 1024,

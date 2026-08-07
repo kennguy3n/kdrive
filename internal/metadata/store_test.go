@@ -44,8 +44,8 @@ func TestMigrationsLoadable(t *testing.T) {
 // loadable from the binary and contain the expected tables.
 func TestEmbeddedMigrations(t *testing.T) {
 	migrations := metadata.EmbeddedMigrations()
-	if len(migrations) != 2 {
-		t.Fatalf("EmbeddedMigrations returned %d migrations, want 2", len(migrations))
+	if len(migrations) != 3 {
+		t.Fatalf("EmbeddedMigrations returned %d migrations, want 3", len(migrations))
 	}
 	if migrations[0].Version != 1 {
 		t.Errorf("migration 0 version = %d, want 1", migrations[0].Version)
@@ -53,7 +53,10 @@ func TestEmbeddedMigrations(t *testing.T) {
 	if migrations[1].Version != 2 {
 		t.Errorf("migration 1 version = %d, want 2", migrations[1].Version)
 	}
-	if len(migrations[0].SQL) == 0 || len(migrations[1].SQL) == 0 {
+	if migrations[2].Version != 3 {
+		t.Errorf("migration 2 version = %d, want 3", migrations[2].Version)
+	}
+	if len(migrations[0].SQL) == 0 || len(migrations[1].SQL) == 0 || len(migrations[2].SQL) == 0 {
 		t.Errorf("embedded migration SQL is empty")
 	}
 	for _, check := range []string{
@@ -67,6 +70,12 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 	if !contains(migrations[1].SQL, "CREATE TABLE IF NOT EXISTS blob_placements") {
 		t.Errorf("embedded migration 1 missing blob_placements table")
+	}
+	if !contains(migrations[2].SQL, "CREATE TABLE IF NOT EXISTS folders") {
+		t.Errorf("embedded migration 2 missing folders table")
+	}
+	if !contains(migrations[2].SQL, "CREATE TABLE IF NOT EXISTS key_envelopes") {
+		t.Errorf("embedded migration 2 missing key_envelopes table")
 	}
 }
 
