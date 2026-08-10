@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -46,11 +47,16 @@ func (d *driveAPI) registerDriveRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/nodes/", d.handleNode)
 	mux.HandleFunc("/v1/uploads:initiate", d.handleUploadInitiate)
 	mux.HandleFunc("/v1/uploads/", d.handleUploadChunks)
+	mux.HandleFunc("/v1/uploads:commitDedup", d.handleUploadCommitDedup)
 	mux.HandleFunc("/v1/versions/", d.handleVersion)
 	mux.HandleFunc("/v1/domains/", d.handleDomain)
 	mux.HandleFunc("/v1/shares", d.handleSharesRoot)
 	mux.HandleFunc("/v1/shares/", d.handleShareRevoke)
 	mux.HandleFunc("/v1/vectors", d.handleVectors)
+	// KDRV1 content dedup endpoints
+	mux.HandleFunc("/v1/content:check", d.handleContentCheck)
+	mux.HandleFunc("/v1/content:checkChunks", d.handleContentCheckChunks)
+	mux.HandleFunc("/v1/content:register", d.handleContentRegister)
 }
 
 // --- CORS middleware ---
@@ -182,6 +188,11 @@ func (d *driveAPI) handleFolderChildren(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	_, tenantID := getUserTenant(r)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
+		return
+	}
 	// Path: /v1/folders/{folder_id}/children
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/folders/"), "/")
 	if len(parts) < 2 || parts[1] != "children" {
@@ -201,12 +212,17 @@ func (d *driveAPI) handleFolderChildren(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusNotFound, "folder not found")
 			return
 		}
+		// Verify folder belongs to requesting tenant
+		if folder.TenantID != tenantID {
+			writeError(w, http.StatusNotFound, "folder not found")
+			return
+		}
 		subFolders, err := d.gw.metaDB.ListFolders(r.Context(), folder.TenantID, folderID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list subfolders")
 			return
 		}
-		nodes, err := d.gw.metaDB.ListNodes(r.Context(), folderID)
+		nodes, err := d.gw.metaDB.ListNodes(r.Context(), folderID, tenantID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list nodes")
 			return
@@ -242,6 +258,11 @@ func (d *driveAPI) handleFolderChildren(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusNotFound, "folder not found")
 			return
 		}
+		// Verify folder belongs to requesting tenant
+		if folder.TenantID != tenantID {
+			writeError(w, http.StatusNotFound, "folder not found")
+			return
+		}
 		nodeID := generateID("node")
 		err = d.gw.metaDB.CreateNode(r.Context(), metadata.Node{
 			ID:            nodeID,
@@ -269,6 +290,11 @@ func (d *driveAPI) handleNode(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	_, tenantID := getUserTenant(r)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
+		return
+	}
 	// Path: /v1/nodes/{node_id}/accessContext
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/nodes/"), "/")
 	if len(parts) < 2 {
@@ -288,7 +314,7 @@ func (d *driveAPI) handleNode(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		snap, err := d.gw.metaDB.GetLatestAccessContext(r.Context(), nodeID)
+		snap, err := d.gw.metaDB.GetLatestAccessContext(r.Context(), nodeID, tenantID)
 		if err != nil {
 			writeError(w, http.StatusNotFound, "no access context")
 			return
@@ -356,6 +382,7 @@ type registeredChunk struct {
 	CiphertextLen int64  `json:"ciphertext_len"`
 }
 
+// In-memory upload sessions (dev mode fallback when Postgres is not available).
 var (
 	uploadSessions   = map[string]*uploadSession{}
 	uploadSessionsMu sync.RWMutex
@@ -390,6 +417,34 @@ func (d *driveAPI) handleUploadInitiate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	sid := generateID("upload")
+
+	// Postgres path
+	if d.gw.metaDB != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		err := d.gw.metaDB.CreateKDRV1UploadSession(ctx, metadata.KDRV1UploadSession{
+			ID:         sid,
+			TenantID:   tenantID,
+			NodeID:     body.NodeID,
+			FolderID:   body.FolderID,
+			ChunkPlan:  body.ChunkPlan,
+			Manifest:   body.Manifest,
+			Header:     body.Header,
+			WrappedDEK: body.WrappedDEK,
+			WrapNonce:  body.WrapNonce,
+			Chunks:     json.RawMessage("[]"),
+			State:      "UPLOADING",
+		})
+		if err != nil {
+			d.gw.logger.Error("drive: create upload session", slog.Any("err", err))
+			writeError(w, http.StatusInternalServerError, "failed to create session")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"session_id": sid})
+		return
+	}
+
+	// In-memory fallback (dev mode)
 	session := &uploadSession{
 		SessionID:  sid,
 		TenantID:   tenantID,
@@ -425,11 +480,9 @@ func (d *driveAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 	sid := parts[0]
 	ordinalStr := strings.SplitN(parts[2], ":", 2)[0]
 
-	uploadSessionsMu.RLock()
-	session, ok := uploadSessions[sid]
-	uploadSessionsMu.RUnlock()
-	if !ok {
-		writeError(w, http.StatusNotFound, "upload session not found")
+	_, tenantID := getUserTenant(r)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
 		return
 	}
 
@@ -471,6 +524,51 @@ func (d *driveAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Postgres path: atomically append chunk to session
+	if d.gw.metaDB != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		chunkJSON, err := json.Marshal(registeredChunk{
+			Index:         ordinal,
+			BlobKey:       blobKey,
+			CiphertextHex: body.CiphertextHex,
+			CiphertextSHA: body.CiphertextSHA,
+			PlaintextLen:  body.PlaintextLen,
+			CiphertextLen: body.CiphertextLen,
+		})
+		if err != nil {
+			d.gw.logger.Error("drive: marshal chunk", slog.Any("err", err))
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := d.gw.metaDB.AppendKDRV1UploadSessionChunk(ctx, sid, tenantID, chunkJSON); err != nil {
+			if errors.Is(err, metadata.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "upload session not found")
+				return
+			}
+			d.gw.logger.Error("drive: append upload session chunk", slog.Any("err", err))
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]string{"blob_key": blobKey})
+		return
+	}
+
+	// In-memory fallback (dev mode)
+	uploadSessionsMu.RLock()
+	session, ok := uploadSessions[sid]
+	uploadSessionsMu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusNotFound, "upload session not found")
+		return
+	}
+	if session.TenantID != tenantID {
+		writeError(w, http.StatusForbidden, "upload session belongs to another tenant")
+		return
+	}
+
 	uploadSessionsMu.Lock()
 	session.Chunks = append(session.Chunks, registeredChunk{
 		Index:         ordinal,
@@ -491,6 +589,11 @@ func (d *driveAPI) handleVersion(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_, tenantID := getUserTenant(r)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
 		return
 	}
 	// Path: /v1/versions/{vid}:authorizeDownload  or  /v1/versions/{vid}
@@ -550,6 +653,11 @@ func (d *driveAPI) handleDomain(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	_, tenantID := getUserTenant(r)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
+		return
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/v1/domains/")
 	parts := strings.Split(path, "/")
 	domainID := parts[0]
@@ -567,7 +675,7 @@ func (d *driveAPI) handleDomain(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		envelopes, err := d.gw.metaDB.ListEnvelopesByDomain(r.Context(), domainID)
+		envelopes, err := d.gw.metaDB.ListEnvelopesByDomain(r.Context(), domainID, tenantID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list envelopes")
 			return
@@ -589,12 +697,12 @@ func (d *driveAPI) handleDomain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		prevEnv, _ := hex.DecodeString(body.PrevKeyEnvelopeHex)
-		err := d.gw.metaDB.RotateEncryptionDomain(r.Context(), domainID, prevEnv)
+		err := d.gw.metaDB.RotateEncryptionDomain(r.Context(), domainID, tenantID, prevEnv)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to rotate domain")
 			return
 		}
-		dom, _ := d.gw.metaDB.GetEncryptionDomain(r.Context(), domainID)
+		dom, _ := d.gw.metaDB.GetEncryptionDomain(r.Context(), domainID, tenantID)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"domain_id":  domainID,
 			"generation": dom.Generation,
@@ -607,7 +715,7 @@ func (d *driveAPI) handleDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	dom, err := d.gw.metaDB.GetEncryptionDomain(r.Context(), domainID)
+	dom, err := d.gw.metaDB.GetEncryptionDomain(r.Context(), domainID, tenantID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
@@ -627,16 +735,20 @@ func (d *driveAPI) handleSharesRoot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	userID, _ := getUserTenant(r)
+	userID, tenantID := getUserTenant(r)
 	if userID == "" {
 		writeError(w, http.StatusBadRequest, "missing X-Demo-User header")
+		return
+	}
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
 		return
 	}
 	if d.gw.metaDB == nil {
 		writeError(w, http.StatusServiceUnavailable, "postgres not configured")
 		return
 	}
-	grants, err := d.gw.metaDB.ListActiveShareGrants(r.Context(), userID)
+	grants, err := d.gw.metaDB.ListActiveShareGrants(r.Context(), userID, tenantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list grants")
 		return
@@ -648,6 +760,11 @@ func (d *driveAPI) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_, tenantID := getUserTenant(r)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
 		return
 	}
 	// Path: /v1/shares/{grant_id}
@@ -664,7 +781,7 @@ func (d *driveAPI) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "postgres not configured")
 		return
 	}
-	err := d.gw.metaDB.RevokeShareGrant(r.Context(), grantID)
+	err := d.gw.metaDB.RevokeShareGrant(r.Context(), grantID, tenantID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "grant not found or already revoked")
 		return

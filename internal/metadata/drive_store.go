@@ -105,10 +105,11 @@ func (s *Store) CreateNode(ctx context.Context, n Node) error {
 }
 
 // ListNodes returns files in a folder.
-func (s *Store) ListNodes(ctx context.Context, folderID string) ([]Node, error) {
+func (s *Store) ListNodes(ctx context.Context, folderID, tenantID string) ([]Node, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, tenant_id, folder_id, name_encrypted, mime_type, created_at, updated_at
-		 FROM nodes WHERE folder_id = $1 AND deleted_at IS NULL ORDER BY created_at`, folderID)
+		 FROM nodes WHERE folder_id = $1 AND tenant_id = $2 AND deleted_at IS NULL ORDER BY created_at`,
+		folderID, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -168,11 +169,11 @@ func (s *Store) CreateEncryptionDomain(ctx context.Context, d EncryptionDomain) 
 }
 
 // GetEncryptionDomain fetches an encryption domain by ID.
-func (s *Store) GetEncryptionDomain(ctx context.Context, id string) (*EncryptionDomain, error) {
+func (s *Store) GetEncryptionDomain(ctx context.Context, id, tenantID string) (*EncryptionDomain, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, tenant_id, COALESCE(folder_id, ''), privacy_mode, generation,
 		        prev_generation, prev_key_envelope, created_at, rotated_at
-		 FROM encryption_domains WHERE id = $1`, id)
+		 FROM encryption_domains WHERE id = $1 AND tenant_id = $2`, id, tenantID)
 	var d EncryptionDomain
 	if err := row.Scan(&d.ID, &d.TenantID, &d.FolderID, &d.PrivacyMode, &d.Generation,
 		&d.PrevGeneration, &d.PrevKeyEnvelope, &d.CreatedAt, &d.RotatedAt); err != nil {
@@ -186,7 +187,7 @@ func (s *Store) GetEncryptionDomain(ctx context.Context, id string) (*Encryption
 
 // RotateEncryptionDomain increments the generation and stores the
 // previous key envelope.
-func (s *Store) RotateEncryptionDomain(ctx context.Context, id string, prevKeyEnvelope []byte) error {
+func (s *Store) RotateEncryptionDomain(ctx context.Context, id, tenantID string, prevKeyEnvelope []byte) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -194,15 +195,16 @@ func (s *Store) RotateEncryptionDomain(ctx context.Context, id string, prevKeyEn
 	defer tx.Rollback()
 	var curGen int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT generation FROM encryption_domains WHERE id = $1 FOR UPDATE`, id).Scan(&curGen); err != nil {
+		`SELECT generation FROM encryption_domains WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+		id, tenantID).Scan(&curGen); err != nil {
 		return err
 	}
 	newGen := curGen + 1
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE encryption_domains
-		    SET generation = $2, prev_generation = $3, prev_key_envelope = $4, rotated_at = now()
-		  WHERE id = $1`,
-		id, newGen, curGen, prevKeyEnvelope); err != nil {
+		    SET generation = $3, prev_generation = $4, prev_key_envelope = $5, rotated_at = now()
+		  WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID, newGen, curGen, prevKeyEnvelope); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -241,11 +243,12 @@ func (s *Store) CreateKeyEnvelope(ctx context.Context, e KeyEnvelope) error {
 }
 
 // ListEnvelopesByDomain returns key envelopes for a domain.
-func (s *Store) ListEnvelopesByDomain(ctx context.Context, domainID string) ([]KeyEnvelope, error) {
+func (s *Store) ListEnvelopesByDomain(ctx context.Context, domainID, tenantID string) ([]KeyEnvelope, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, COALESCE(domain_id, ''), COALESCE(version_id, ''), tenant_id, envelope_type,
 		        ciphertext, nonce, COALESCE(encapsulated_key, ''::bytea), metadata, created_at
-		 FROM key_envelopes WHERE domain_id = $1 ORDER BY created_at`, domainID)
+		 FROM key_envelopes WHERE domain_id = $1 AND tenant_id = $2 ORDER BY created_at`,
+		domainID, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -316,13 +319,13 @@ func (s *Store) CreateShareGrant(ctx context.Context, g ShareGrant) error {
 	return err
 }
 
-// ListActiveShareGrants returns active grants for a grantee.
-func (s *Store) ListActiveShareGrants(ctx context.Context, granteeUserID string) ([]ShareGrant, error) {
+// ListActiveShareGrants returns active grants for a grantee (tenant-scoped).
+func (s *Store) ListActiveShareGrants(ctx context.Context, granteeUserID, tenantID string) ([]ShareGrant, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, tenant_id, COALESCE(node_id, ''), grantor_user_id, grantee_user_id,
 		        generation, is_active, COALESCE(key_envelope_id, ''), created_at, revoked_at
-		 FROM share_grants WHERE grantee_user_id = $1 AND is_active = true ORDER BY created_at DESC`,
-		granteeUserID)
+		 FROM share_grants WHERE grantee_user_id = $1 AND tenant_id = $2 AND is_active = true ORDER BY created_at DESC`,
+		granteeUserID, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -339,10 +342,11 @@ func (s *Store) ListActiveShareGrants(ctx context.Context, granteeUserID string)
 	return out, rows.Err()
 }
 
-// RevokeShareGrant marks a share grant as revoked.
-func (s *Store) RevokeShareGrant(ctx context.Context, id string) error {
+// RevokeShareGrant marks a share grant as revoked (tenant-scoped).
+func (s *Store) RevokeShareGrant(ctx context.Context, id, tenantID string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE share_grants SET is_active = false, revoked_at = now() WHERE id = $1 AND is_active = true`, id)
+		`UPDATE share_grants SET is_active = false, revoked_at = now()
+		  WHERE id = $1 AND tenant_id = $2 AND is_active = true`, id, tenantID)
 	if err != nil {
 		return err
 	}
@@ -379,11 +383,12 @@ func (s *Store) CreateAccessContextSnapshot(ctx context.Context, a AccessContext
 	return err
 }
 
-// GetLatestAccessContext returns the latest snapshot for a node.
-func (s *Store) GetLatestAccessContext(ctx context.Context, nodeID string) (*AccessContextSnapshot, error) {
+// GetLatestAccessContext returns the latest snapshot for a node (tenant-scoped).
+func (s *Store) GetLatestAccessContext(ctx context.Context, nodeID, tenantID string) (*AccessContextSnapshot, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, tenant_id, COALESCE(node_id, ''), revision, snapshot_hash, acl_ciphertext, created_at
-		 FROM access_context_snapshots WHERE node_id = $1 ORDER BY revision DESC LIMIT 1`, nodeID)
+		 FROM access_context_snapshots WHERE node_id = $1 AND tenant_id = $2 ORDER BY revision DESC LIMIT 1`,
+		nodeID, tenantID)
 	var a AccessContextSnapshot
 	if err := row.Scan(&a.ID, &a.TenantID, &a.NodeID, &a.Revision, &a.SnapshotHash, &a.ACLCiphertext, &a.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

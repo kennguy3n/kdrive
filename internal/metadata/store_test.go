@@ -44,8 +44,8 @@ func TestMigrationsLoadable(t *testing.T) {
 // loadable from the binary and contain the expected tables.
 func TestEmbeddedMigrations(t *testing.T) {
 	migrations := metadata.EmbeddedMigrations()
-	if len(migrations) != 3 {
-		t.Fatalf("EmbeddedMigrations returned %d migrations, want 3", len(migrations))
+	if len(migrations) != 6 {
+		t.Fatalf("EmbeddedMigrations returned %d migrations, want 6", len(migrations))
 	}
 	if migrations[0].Version != 1 {
 		t.Errorf("migration 0 version = %d, want 1", migrations[0].Version)
@@ -56,8 +56,19 @@ func TestEmbeddedMigrations(t *testing.T) {
 	if migrations[2].Version != 3 {
 		t.Errorf("migration 2 version = %d, want 3", migrations[2].Version)
 	}
-	if len(migrations[0].SQL) == 0 || len(migrations[1].SQL) == 0 || len(migrations[2].SQL) == 0 {
-		t.Errorf("embedded migration SQL is empty")
+	if migrations[3].Version != 4 {
+		t.Errorf("migration 3 version = %d, want 4", migrations[3].Version)
+	}
+	if migrations[4].Version != 5 {
+		t.Errorf("migration 4 version = %d, want 5", migrations[4].Version)
+	}
+	if migrations[5].Version != 6 {
+		t.Errorf("migration 5 version = %d, want 6", migrations[5].Version)
+	}
+	for _, m := range migrations {
+		if len(m.SQL) == 0 {
+			t.Errorf("migration %d has empty SQL", m.Version)
+		}
 	}
 	for _, check := range []string{
 		"CREATE TABLE IF NOT EXISTS file_versions",
