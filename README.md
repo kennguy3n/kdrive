@@ -152,11 +152,11 @@ kdrive/
 ├── internal/
 │   ├── server/
 │   │   ├── server.go               # Gateway wiring: store, cache, pipeline, mux
-│   │   ├── drive_demo.go           # Demo API HTTP handlers (/v1/* endpoints)
+│   │   ├── drive_api.go            # Drive REST API HTTP handlers (/v1/* endpoints)
 │   │   └── metrics.go              # Prometheus-format /metrics exporter
 │   ├── metadata/
 │   │   ├── store.go                # Postgres metadata store (CRUD, migrations)
-│   │   ├── drive_demo.go           # Demo metadata structs + queries
+│   │   ├── drive_store.go          # Drive metadata structs + queries (folders, nodes, domains, shares)
 │   │   ├── status_store.go         # blob_placements table (blobio.StatusStore)
 │   │   └── embedded.go             # Embedded SQL migrations
 │   ├── blobio/
@@ -200,7 +200,7 @@ kdrive/
 │   ├── migrations/
 │   │   ├── 001_init.sql            # Core schema (tenants, files, versions, outbox, ledger)
 │   │   ├── 002_blob_placements.sql # Blob placement tracking (decoupled from file_versions)
-│   │   └── 003_drive_demo.sql      # Demo schema + seed data (folders, nodes, domains, shares)
+│   │   └── 003_drive_demo.sql      # Drive schema (folders, nodes, domains, shares) + demo seed data
 │   ├── dev/
 │   │   └── docker-compose.yml      # Dev stack (Postgres + gateway)
 │   └── sme/
@@ -315,16 +315,17 @@ Wasabi endpoint/region/bucket/credentials).
 | `GET` | `/readyz` | Readiness probe (checks Postgres `Ping` + a Wasabi `Head` probe) |
 | `GET` | `/metrics` | Prometheus-format metrics (see [Observability](#observability)) |
 
-### Demo API Endpoints (`/v1/`)
+### Drive API Endpoints (`/v1/`)
 
-The demo API is mounted only when Postgres is configured. It implements the
-§17 subset needed for the React web sample (plan Part C) and demonstrates
-all three privacy modes (Secured / Advanced / Max) against the live Go
+The Drive REST API is mounted only when Postgres is configured. It
+implements the §17 client API surface (plan Part C) and supports all
+three privacy modes (Secured / Advanced / Max). The web sample uses
+these endpoints to demonstrate end-to-end encryption against the live
 gateway.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/v1/tenants` | List all demo tenants |
+| `GET` | `/v1/tenants` | List all tenants |
 | `GET` | `/v1/folders?parent=` | List root or child folders |
 | `POST` | `/v1/folders` | Create a folder |
 | `GET` | `/v1/folders/{id}/children` | Get folder + sub-folders + nodes |
@@ -344,8 +345,11 @@ gateway.
 All `/v1/` endpoints:
 
 - Accept `X-Demo-Tenant` and `X-Demo-User` headers for multi-tenancy
-  routing (the gateway is untrusted and does not authenticate these — the
-  demo intentionally trusts the client for sample purposes).
+  routing in the current implementation. These are demo-only auth —
+  production replaces `getUserTenant` in `internal/server/drive_api.go`
+  with KChat's real identity layer (session tokens, device certificates).
+  The gateway is untrusted and does not authenticate these headers — it
+  trusts the caller for demo / web-sample purposes only.
 - Set CORS headers (`Access-Control-Allow-Origin: *`) so the React web
   sample can call them directly.
 - Are wrapped by `withWebHeaders`, which sets `Cross-Origin-Opener-Policy:

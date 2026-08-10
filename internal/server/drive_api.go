@@ -1,7 +1,13 @@
-// Package server — drive demo HTTP handlers. These implement the
-// §17 subset needed for the React web sample (plan Part C).
+// Package server — Drive REST API HTTP handlers. These implement the
+// §17 client API surface (plan Part C): tenants, folders, nodes,
+// uploads, versions, encryption domains, share grants, and test vectors.
 // The gateway stores only ciphertext + opaque metadata; it never
 // holds plaintext Drive keys.
+//
+// Authentication: the current implementation trusts X-Demo-Tenant and
+// X-Demo-User headers for demo / web-sample purposes. Production
+// deployments replace getUserTenant with KChat's real identity layer
+// (session tokens, device certificates) in front of these handlers.
 package server
 
 import (
@@ -21,19 +27,19 @@ import (
 	"github.com/kchat/drive/pkg/blobstore"
 )
 
-// demoAPI is the HTTP handler for all /v1/ drive demo endpoints.
+// driveAPI is the HTTP handler for all /v1/ Drive REST API endpoints.
 // It is mounted on the gateway mux when Postgres is available.
-type demoAPI struct {
+type driveAPI struct {
 	gw *Gateway
 }
 
-// newDemoAPI creates the demo API handler.
-func newDemoAPI(gw *Gateway) *demoAPI {
-	return &demoAPI{gw: gw}
+// newDriveAPI creates the Drive API handler.
+func newDriveAPI(gw *Gateway) *driveAPI {
+	return &driveAPI{gw: gw}
 }
 
-// registerDemoRoutes wires all /v1/ endpoints onto the mux.
-func (d *demoAPI) registerDemoRoutes(mux *http.ServeMux) {
+// registerDriveRoutes wires all /v1/ endpoints onto the mux.
+func (d *driveAPI) registerDriveRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/tenants", d.handleTenants)
 	mux.HandleFunc("/v1/folders", d.handleFoldersRoot)
 	mux.HandleFunc("/v1/folders/", d.handleFolderChildren)
@@ -65,6 +71,9 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// getUserTenant extracts the caller identity from request headers.
+// DEMO AUTH: trusts X-Demo-User / X-Demo-Tenant headers for the web
+// sample. Production replaces this with KChat's identity layer.
 func getUserTenant(r *http.Request) (userID, tenantID string) {
 	userID = r.Header.Get("X-Demo-User")
 	tenantID = r.Header.Get("X-Demo-Tenant")
@@ -73,7 +82,7 @@ func getUserTenant(r *http.Request) (userID, tenantID string) {
 
 // --- Tenants ---
 
-func (d *demoAPI) handleTenants(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleTenants(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -87,21 +96,21 @@ func (d *demoAPI) handleTenants(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "postgres not configured")
 		return
 	}
-	tenants, err := d.gw.metaDB.ListTenantsDemo(r.Context())
+	tenants, err := d.gw.metaDB.ListDriveTenants(r.Context())
 	if err != nil {
-		d.gw.logger.Error("demo: list tenants", slog.Any("err", err))
+		d.gw.logger.Error("drive: list tenants", slog.Any("err", err))
 		writeError(w, http.StatusInternalServerError, "failed to list tenants")
 		return
 	}
 	if tenants == nil {
-		tenants = []metadata.TenantDemo{}
+		tenants = []metadata.DriveTenant{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"tenants": tenants})
 }
 
 // --- Folders ---
 
-func (d *demoAPI) handleFoldersRoot(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleFoldersRoot(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -167,7 +176,7 @@ func (d *demoAPI) handleFoldersRoot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (d *demoAPI) handleFolderChildren(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleFolderChildren(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -254,7 +263,7 @@ func (d *demoAPI) handleFolderChildren(w http.ResponseWriter, r *http.Request) {
 
 // --- Nodes ---
 
-func (d *demoAPI) handleNode(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleNode(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -352,7 +361,7 @@ var (
 	uploadSessionsMu sync.RWMutex
 )
 
-func (d *demoAPI) handleUploadInitiate(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleUploadInitiate(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -400,7 +409,7 @@ func (d *demoAPI) handleUploadInitiate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"session_id": sid})
 }
 
-func (d *demoAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -456,7 +465,7 @@ func (d *demoAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 			ContentType:    "application/octet-stream",
 		})
 		if err != nil {
-			d.gw.logger.Error("demo: store chunk", slog.Any("err", err))
+			d.gw.logger.Error("drive: store chunk", slog.Any("err", err))
 			writeError(w, http.StatusInternalServerError, "failed to store chunk")
 			return
 		}
@@ -478,7 +487,7 @@ func (d *demoAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 
 // --- Versions ---
 
-func (d *demoAPI) handleVersion(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleVersion(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -499,7 +508,9 @@ func (d *demoAPI) handleVersion(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		// Return a short-lived download capability (demo: just echo the version ID).
+		// Return a short-lived download capability.
+		// TODO: sign the capability with a gateway key and bind it to the
+		// caller's identity + the blob key (plan §17).
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"version_id": vid,
 			"capability": fmt.Sprintf("cap_%s_%d", vid, time.Now().Unix()),
@@ -512,9 +523,10 @@ func (d *demoAPI) handleVersion(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Return the stored manifest for this version.
+		// TODO: fetch the actual encrypted manifest from metadata store.
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"version_id": vid,
-			"manifest":   "demo_manifest_placeholder",
+			"manifest":   "manifest_not_yet_persisted",
 		})
 
 	default:
@@ -532,7 +544,7 @@ func (d *demoAPI) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 // --- Domains ---
 
-func (d *demoAPI) handleDomain(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleDomain(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -605,7 +617,7 @@ func (d *demoAPI) handleDomain(w http.ResponseWriter, r *http.Request) {
 
 // --- Shares ---
 
-func (d *demoAPI) handleSharesRoot(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleSharesRoot(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -632,7 +644,7 @@ func (d *demoAPI) handleSharesRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"grants": grants})
 }
 
-func (d *demoAPI) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -662,7 +674,7 @@ func (d *demoAPI) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 
 // --- Vectors ---
 
-func (d *demoAPI) handleVectors(w http.ResponseWriter, r *http.Request) {
+func (d *driveAPI) handleVectors(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)

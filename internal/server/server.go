@@ -131,10 +131,10 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("/readyz", g.handleReadyz)
 	mux.HandleFunc("/metrics", g.handleMetrics)
 
-	// Register drive demo API routes when Postgres is available.
+	// Register Drive REST API routes when Postgres is available.
 	if g.metaDB != nil {
-		demo := newDemoAPI(g)
-		demo.registerDemoRoutes(mux)
+		api := newDriveAPI(g)
+		api.registerDriveRoutes(mux)
 	}
 
 	// Wrap with CORS/COOP/COEP headers for the web sample.

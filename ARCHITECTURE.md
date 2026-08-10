@@ -40,19 +40,29 @@ pointing at that document.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Browser (Client)                              │
+│                          Clients (Rust SDK)                          │
 │                                                                      │
-│  React UI → TypeScript API Client → WASM (Rust crypto SDK)          │
-│  IndexedDB key vault (DEKs, domain keys, Ed25519 keys)              │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ HTTP (ciphertext + wrapped keys only)
-                               │ X-Demo-Tenant / X-Demo-User headers
-                               ▼
+│  Browser (WASM)        Native (UniFFI)        Electron (NAPI-RS)     │
+│  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐       │
+│  │ React UI     │      │ Swift/Kotlin │      │ JS addon     │       │
+│  │   ↓          │      │   ↓          │      │   ↓          │       │
+│  │ wasm-bindgen │      │ uniffi       │      │ napi-rs      │       │
+│  │   ↓          │      │   ↓          │      │   ↓          │       │
+│  │ DriveFacade  │      │ DriveFacade  │      │ DriveFacade  │       │
+│  │   ↓          │      │   ↓          │      │   ↓          │       │
+│  │ crypto+mls   │      │ crypto+mls   │      │ crypto+mls   │       │
+│  └──────────────┘      └──────────────┘      └──────────────┘       │
+│  IndexedDB vault        SQLCipher vault        SQLCipher vault       │
+└─────────┬─────────────────────┬─────────────────────┬───────────────┘
+          │ HTTPS (ciphertext + wrapped keys only)                    │
+          │ Auth: KChat identity layer (session tokens / device certs) │
+          │ Demo/dev: X-Demo-Tenant / X-Demo-User headers              │
+          ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     Go Gateway (drive-gateway)                       │
 │                                                                      │
 │  ┌──────────┐  ┌───────────┐  ┌──────────────┐  ┌──────────────┐    │
-│  │ HTTP Mux │─▶│ Demo API  │─▶│ Metadata     │─▶│ Postgres     │    │
+│  │ HTTP Mux │─▶│ Drive API │─▶│ Metadata     │─▶│ Postgres     │    │
 │  │ /healthz │  │ /v1/*     │  │ Store        │  │              │    │
 │  │ /readyz  │  │           │  │              │  │ tenants      │    │
 │  │ /metrics │  │           │  │              │  │ files        │    │
@@ -89,7 +99,7 @@ pointing at that document.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ Client (Browser / Native app) — TRUSTED          │
+│ Client (Browser / Native / Electron) — TRUSTED   │
 │  ✓ Plaintext file content                        │
 │  ✓ Version DEK (plaintext)                       │
 │  ✓ Domain Key / Share Grant Key (plaintext)      │
@@ -115,9 +125,12 @@ identifiers (§3 invariant 14). The gateway stores encrypted names as
 `BYTEA`, key material only as wrapped envelopes (`key_envelopes`), and
 file content only as ciphertext.
 
-The demo API intentionally trusts `X-Demo-Tenant` / `X-Demo-User` headers
-for sample purposes; production deployments replace this with real
-authentication in front of the gateway (e.g. via KChat's identity layer).
+**Authentication:** Production deployments authenticate callers via
+KChat's identity layer (session tokens, device certificates) in front of
+the Drive API handlers. The current implementation trusts `X-Demo-Tenant`
+and `X-Demo-User` headers for demo / web-sample purposes only —
+`getUserTenant` in `internal/server/drive_api.go` is the single swap point
+for production auth.
 
 ## Privacy Modes
 
@@ -393,9 +406,11 @@ without the UPDATE-by-`blob_key` problem. Keyed by `blob_key` (PRIMARY
 KEY). Backfilled from `file_versions` on first run via
 `INSERT ... SELECT DISTINCT ON (blob_key)`.
 
-### Demo Schema (`003_drive_demo.sql`)
+### Drive Schema (`003_drive_demo.sql`)
 
-Extends the core schema for the React web sample:
+Extends the core schema with the Drive-specific tables (folders, nodes,
+encryption domains, key envelopes, share grants, access-context snapshots)
+and seeds demo data for the web sample:
 
 | Table | Purpose |
 | --- | --- |
@@ -717,7 +732,7 @@ loader:
      (30s timeout), build `PostgresStatusStore`, wire pipeline with it.
    - Else: wire pipeline with in-memory `StatusStore`.
 3. Build HTTP handler: `/healthz`, `/readyz`, `/metrics`, and (if
-   Postgres configured) the demo `/v1/*` routes. Wrap with
+   Postgres configured) the Drive `/v1/*` REST API routes. Wrap with
    `withWebHeaders` (COOP/COEP for the WASM web sample).
 4. `ListenAndServe` on `:8080` with a 10s `ReadHeaderTimeout`.
 5. On `SIGINT`/`SIGTERM`: `Shutdown` (30s), then `srv.Close` (pipeline →

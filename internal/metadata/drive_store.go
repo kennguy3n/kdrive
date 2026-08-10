@@ -1,7 +1,7 @@
-// Package metadata — demo table accessors for the Drive web sample.
-// These methods extend Store with CRUD for the tables introduced in
-// migration 003_drive_demo.sql: folders, nodes, encryption_domains,
-// key_envelopes, share_grants, access_context_snapshots.
+// Package metadata — Drive table accessors. These methods extend Store
+// with CRUD for the tables introduced in migration 003_drive_demo.sql:
+// folders, nodes, encryption_domains, key_envelopes, share_grants,
+// access_context_snapshots.
 package metadata
 
 import (
@@ -13,7 +13,7 @@ import (
 
 // --- Folder ---
 
-// Folder is a folder row from the demo schema.
+// Folder is a folder row from the drive schema.
 type Folder struct {
 	ID             string    `json:"id"`
 	TenantID       string    `json:"tenant_id"`
@@ -84,7 +84,7 @@ func (s *Store) GetFolder(ctx context.Context, id string) (*Folder, error) {
 
 // --- Node ---
 
-// Node is a file node in the demo schema.
+// Node is a file node in the drive schema.
 type Node struct {
 	ID            string    `json:"id"`
 	TenantID      string    `json:"tenant_id"`
@@ -396,8 +396,9 @@ func (s *Store) GetLatestAccessContext(ctx context.Context, nodeID string) (*Acc
 
 // --- Tenant extensions ---
 
-// GetTenantWithMode returns a tenant with the demo columns.
-type TenantDemo struct {
+// DriveTenant is a tenant with the drive-specific columns
+// (tenant_type, bucket_name) added by migration 003.
+type DriveTenant struct {
 	ID          string `json:"id"`
 	PoolID      string `json:"pool_id"`
 	PrivacyMode string `json:"privacy_mode"`
@@ -405,11 +406,11 @@ type TenantDemo struct {
 	BucketName  string `json:"bucket_name"`
 }
 
-// GetTenantDemo fetches a tenant with demo columns.
-func (s *Store) GetTenantDemo(ctx context.Context, id string) (*TenantDemo, error) {
+// GetDriveTenant fetches a tenant with the drive columns.
+func (s *Store) GetDriveTenant(ctx context.Context, id string) (*DriveTenant, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, pool_id, privacy_mode, tenant_type, bucket_name FROM tenants WHERE id = $1`, id)
-	var t TenantDemo
+	var t DriveTenant
 	if err := row.Scan(&t.ID, &t.PoolID, &t.PrivacyMode, &t.TenantType, &t.BucketName); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -419,17 +420,17 @@ func (s *Store) GetTenantDemo(ctx context.Context, id string) (*TenantDemo, erro
 	return &t, nil
 }
 
-// ListTenantsDemo returns all tenants.
-func (s *Store) ListTenantsDemo(ctx context.Context) ([]TenantDemo, error) {
+// ListDriveTenants returns all tenants.
+func (s *Store) ListDriveTenants(ctx context.Context) ([]DriveTenant, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, pool_id, privacy_mode, tenant_type, bucket_name FROM tenants ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []TenantDemo
+	var out []DriveTenant
 	for rows.Next() {
-		var t TenantDemo
+		var t DriveTenant
 		if err := rows.Scan(&t.ID, &t.PoolID, &t.PrivacyMode, &t.TenantType, &t.BucketName); err != nil {
 			return nil, err
 		}
