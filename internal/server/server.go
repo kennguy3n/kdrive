@@ -137,6 +137,11 @@ func (g *Gateway) Handler() http.Handler {
 		api.registerDriveRoutes(mux)
 	}
 
+	// Register chat-storage endpoints (archive, search, backup, delivery).
+	// These work with the blob store directly and don't require Postgres.
+	chatAPI := newChatStorageAPI(g)
+	chatAPI.registerChatStorageRoutes(mux)
+
 	// Wrap with CORS/COOP/COEP headers for the web sample.
 	return withWebHeaders(mux)
 }
