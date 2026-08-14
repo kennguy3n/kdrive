@@ -64,7 +64,7 @@ func (d *driveAPI) registerDriveRoutes(mux *http.ServeMux) {
 func setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Demo-User, X-Demo-Tenant")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-Id, X-User-Id, X-Demo-User, X-Demo-Tenant")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -78,9 +78,16 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 // getUserTenant extracts the caller identity from request headers.
-// DEMO AUTH: trusts X-Demo-User / X-Demo-Tenant headers for the web
-// sample. Production replaces this with KChat's identity layer.
+// Accepts either production headers (Authorization + X-Tenant-Id + X-User-Id)
+// or demo headers (X-Demo-User / X-Demo-Tenant) for backward compatibility.
 func getUserTenant(r *http.Request) (userID, tenantID string) {
+	// Try production headers first
+	userID = r.Header.Get("X-User-Id")
+	tenantID = r.Header.Get("X-Tenant-Id")
+	if userID != "" && tenantID != "" {
+		return
+	}
+	// Fall back to demo headers
 	userID = r.Header.Get("X-Demo-User")
 	tenantID = r.Header.Get("X-Demo-Tenant")
 	return

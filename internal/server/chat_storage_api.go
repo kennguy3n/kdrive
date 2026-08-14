@@ -31,14 +31,28 @@ func newChatStorageAPI(g *Gateway) *chatStorageAPI {
 	}
 }
 
-// requireAuth checks for tenant and user headers. Returns the tenant ID and false if missing.
+// requireAuth checks for authentication and returns the tenant ID.
+//
+// Accepts either:
+//   - Authorization: Bearer <token> + X-Tenant-Id + X-User-Id (production)
+//   - X-Demo-Tenant + X-Demo-User (backward compat for existing tests)
+//
+// Returns the tenant ID and false if authentication is missing.
 func (c *chatStorageAPI) requireAuth(r *http.Request) (string, bool) {
-	tenant := r.Header.Get("X-Demo-Tenant")
-	user := r.Header.Get("X-Demo-User")
-	if tenant == "" || user == "" {
-		return "", false
+	// Try production headers first
+	tenant := r.Header.Get("X-Tenant-Id")
+	user := r.Header.Get("X-User-Id")
+	auth := r.Header.Get("Authorization")
+	if tenant != "" && user != "" && auth != "" {
+		return tenant, true
 	}
-	return tenant, true
+	// Fall back to demo headers for backward compatibility
+	tenant = r.Header.Get("X-Demo-Tenant")
+	user = r.Header.Get("X-Demo-User")
+	if tenant != "" && user != "" {
+		return tenant, true
+	}
+	return "", false
 }
 
 // tenantPrefix returns the tenant-scoped blob key prefix.
@@ -53,6 +67,8 @@ func (c *chatStorageAPI) registerChatStorageRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/chat/archive/manifests", c.handleArchiveManifests)
 	mux.HandleFunc("/v1/chat/search/shards/", c.handleSearchShard)
 	mux.HandleFunc("/v1/chat/backup/manifests", c.handleBackupManifests)
+	mux.HandleFunc("/v1/chat/backup/segment/", c.handleBackupSegment)
+	mux.HandleFunc("/v1/chat/media/", c.handleMediaBlob)
 }
 
 // sanitizeObjectID validates that an ID is safe for use as a blob path component.
@@ -349,6 +365,140 @@ func (c *chatStorageAPI) handleBackupManifests(w http.ResponseWriter, r *http.Re
 		after := r.URL.Query().Get("after")
 		_ = after
 		writeJSON(w, http.StatusOK, map[string][]json.RawMessage{"manifests": {}})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+// --- Backup segments ---
+
+func (c *chatStorageAPI) handleBackupSegment(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	tenant, ok := c.requireAuth(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		return
+	}
+
+	segmentID := strings.TrimPrefix(r.URL.Path, "/v1/chat/backup/segment/")
+	if !sanitizeObjectID(segmentID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid segment_id"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 256<<20)) // 256 MB max
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		objRef := fmt.Sprintf("%schat-backup/segments/%s", tenantPrefix(tenant), segmentID)
+		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
+			Key:            objRef,
+			Body:           bytes.NewReader(body),
+			ExpectedLength: int64(len(body)),
+		})
+		if err != nil {
+			c.logger.Error("backup segment upload failed", "segment_id", segmentID, "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"segment_id": segmentID})
+
+	case http.MethodGet:
+		objRef := fmt.Sprintf("%schat-backup/segments/%s", tenantPrefix(tenant), segmentID)
+		rc, _, err := c.gw.store.Get(ctx, blobstore.GetRequest{
+			Ref: blobstore.VersionedObjectRef{Key: objRef},
+		})
+		if err != nil {
+			if errors.Is(err, blobstore.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "segment not found"})
+				return
+			}
+			c.logger.Error("backup segment download failed", "segment_id", segmentID, "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "download failed"})
+			return
+		}
+		defer rc.Close()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, rc)
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+// --- Media blobs ---
+
+func (c *chatStorageAPI) handleMediaBlob(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	tenant, ok := c.requireAuth(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		return
+	}
+
+	blobID := strings.TrimPrefix(r.URL.Path, "/v1/chat/media/")
+	if !sanitizeObjectID(blobID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid blob_id"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 256<<20)) // 256 MB max
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		objRef := fmt.Sprintf("%schat-media/%s", tenantPrefix(tenant), blobID)
+		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
+			Key:            objRef,
+			Body:           bytes.NewReader(body),
+			ExpectedLength: int64(len(body)),
+		})
+		if err != nil {
+			c.logger.Error("media blob upload failed", "blob_id", blobID, "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"blob_id": blobID})
+
+	case http.MethodGet:
+		objRef := fmt.Sprintf("%schat-media/%s", tenantPrefix(tenant), blobID)
+		rc, _, err := c.gw.store.Get(ctx, blobstore.GetRequest{
+			Ref: blobstore.VersionedObjectRef{Key: objRef},
+		})
+		if err != nil {
+			if errors.Is(err, blobstore.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "blob not found"})
+				return
+			}
+			c.logger.Error("media blob download failed", "blob_id", blobID, "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "download failed"})
+			return
+		}
+		defer rc.Close()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, rc)
 
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
