@@ -111,12 +111,21 @@ func (c *MemoryCache) Put(_ context.Context, blobID string, r io.Reader, opts Pu
 	if r == nil {
 		return errors.New("hotcache: reader is required")
 	}
-	data, err := io.ReadAll(r)
+	// Pre-check size if provided to avoid OOM on oversized blobs.
+	if opts.SizeBytes > 0 && c.policy.MaxBytes > 0 && opts.SizeBytes > int64(c.policy.MaxBytes) {
+		return fmt.Errorf("hotcache: blob %d bytes exceeds cache capacity %d", opts.SizeBytes, c.policy.MaxBytes)
+	}
+	// Use LimitReader as a safety net even when SizeBytes is not provided.
+	var reader io.Reader = r
+	if c.policy.MaxBytes > 0 {
+		reader = io.LimitReader(r, int64(c.policy.MaxBytes)+1)
+	}
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return fmt.Errorf("hotcache: buffer blob: %w", err)
 	}
 	size := int64(len(data))
-	if c.policy.MaxBytes > 0 && size > c.policy.MaxBytes {
+	if c.policy.MaxBytes > 0 && size > int64(c.policy.MaxBytes) {
 		return fmt.Errorf("hotcache: blob %d bytes exceeds cache capacity %d", size, c.policy.MaxBytes)
 	}
 	c.mu.Lock()

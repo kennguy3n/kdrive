@@ -379,6 +379,9 @@ func (p *Pipeline) Read(ctx context.Context, blobID string) (ReadResult, error) 
 	go func() {
 		defer p.wg.Done()
 		bgCtx := p.lifecycleCtx
+		if bgCtx.Err() != nil {
+			return
+		}
 		if err := p.cache.Put(bgCtx, blobID, bytes.NewReader(body), hotcache.PutOptions{
 			SizeBytes:    meta.Size,
 			Hash:         meta.ChecksumSHA256,
@@ -483,6 +486,15 @@ const promoteMultipartThreshold = 100 * 1024 * 1024 // 100 MiB
 
 // promotePartSize is the size of each multipart upload part.
 const promotePartSize = 16 * 1024 * 1024 // 16 MiB
+
+// partBufferPool reuses part-sized byte slices across promoteMultipart
+// calls to avoid repeated 16 MiB allocations and GC pressure.
+var partBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, promotePartSize)
+		return &b
+	},
+}
 
 // Promote writes a cached blob to the durable origin and flips its
 // status to COMMITTED_DURABLE. It is called by the async promoter
@@ -743,10 +755,12 @@ func (p *Pipeline) promoteMultipart(ctx context.Context, blobID string, r io.Rea
 	// Read parts and feed workers. Track the total part count so the
 	// collector knows when to stop.
 	partNum := int32(1)
-	buf := make([]byte, promotePartSize)
+	bufPtr := partBufferPool.Get().(*[]byte)
+	buf := *bufPtr
 	var readErr error
 	go func() {
 		defer close(partCh)
+		defer partBufferPool.Put(bufPtr)
 		for {
 			if multipartCtx.Err() != nil {
 				readErr = multipartCtx.Err()

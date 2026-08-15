@@ -11,8 +11,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/lib/pq"
@@ -135,7 +133,8 @@ func (s *Store) GetContentChunks(ctx context.Context, contentID, tenantID string
 
 // CreateContentChunks inserts all chunks for a content entry.
 // Chunks are inserted idempotently (ON CONFLICT DO NOTHING).
-// Uses batched multi-row INSERT for efficiency (500 rows per batch).
+// Uses a prepared statement executed per row within a transaction
+// for efficiency and safety (avoids dynamic SQL string building).
 func (s *Store) CreateContentChunks(ctx context.Context, contentID string, chunks []ContentChunk) error {
 	if len(chunks) == 0 {
 		return nil
@@ -146,35 +145,26 @@ func (s *Store) CreateContentChunks(ctx context.Context, contentID string, chunk
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	const batchSize = 500
-	for start := 0; start < len(chunks); start += batchSize {
-		end := start + batchSize
-		if end > len(chunks) {
-			end = len(chunks)
-		}
-		batch := chunks[start:end]
-
-		// Build multi-row VALUES clause: ($1,$2,$3,$4,$5,$6), ($7,$8,...), ...
-		var sb strings.Builder
-		sb.WriteString(`INSERT INTO content_chunks
+	// Prepare the single-row INSERT once and reuse it for every chunk.
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO content_chunks
 		   (content_id, chunk_index, chunk_content_hash, blob_key,
 		    plaintext_len, ciphertext_len)
-		 VALUES `)
-		args := make([]interface{}, 0, len(batch)*6)
-		for i, c := range batch {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			base := i * 6
-			fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d)",
-				base+1, base+2, base+3, base+4, base+5, base+6)
-			args = append(args,
-				contentID, c.ChunkIndex, c.ChunkContentHash, c.BlobKey,
-				c.PlaintextLen, c.CiphertextLen)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (content_id, chunk_index) DO NOTHING`)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if stmt != nil {
+			stmt.Close() //nolint:errcheck
 		}
-		sb.WriteString(` ON CONFLICT (content_id, chunk_index) DO NOTHING`)
+	}()
 
-		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+	for _, c := range chunks {
+		if _, err := stmt.ExecContext(ctx,
+			contentID, c.ChunkIndex, c.ChunkContentHash, c.BlobKey,
+			c.PlaintextLen, c.CiphertextLen); err != nil {
 			return err
 		}
 	}

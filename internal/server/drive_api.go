@@ -32,11 +32,20 @@ import (
 // It is mounted on the gateway mux when Postgres is available.
 type driveAPI struct {
 	gw *Gateway
+
+	// In-memory upload sessions (dev mode fallback when Postgres is
+	// not available). Moved from package-level vars to the struct so
+	// each gateway instance has its own session map.
+	sessions   map[string]*uploadSession
+	sessionsMu sync.RWMutex
 }
 
 // newDriveAPI creates the Drive API handler.
 func newDriveAPI(gw *Gateway) *driveAPI {
-	return &driveAPI{gw: gw}
+	return &driveAPI{
+		gw:       gw,
+		sessions: map[string]*uploadSession{},
+	}
 }
 
 // registerDriveRoutes wires all /v1/ endpoints onto the mux.
@@ -389,12 +398,6 @@ type registeredChunk struct {
 	CiphertextLen int64  `json:"ciphertext_len"`
 }
 
-// In-memory upload sessions (dev mode fallback when Postgres is not available).
-var (
-	uploadSessions   = map[string]*uploadSession{}
-	uploadSessionsMu sync.RWMutex
-)
-
 func (d *driveAPI) handleUploadInitiate(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 	if r.Method == http.MethodOptions {
@@ -465,9 +468,9 @@ func (d *driveAPI) handleUploadInitiate(w http.ResponseWriter, r *http.Request) 
 		Chunks:     []registeredChunk{},
 		CreatedAt:  time.Now(),
 	}
-	uploadSessionsMu.Lock()
-	uploadSessions[sid] = session
-	uploadSessionsMu.Unlock()
+	d.sessionsMu.Lock()
+	d.sessions[sid] = session
+	d.sessionsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"session_id": sid})
 }
 
@@ -564,9 +567,9 @@ func (d *driveAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// In-memory fallback (dev mode)
-	uploadSessionsMu.RLock()
-	session, ok := uploadSessions[sid]
-	uploadSessionsMu.RUnlock()
+	d.sessionsMu.RLock()
+	session, ok := d.sessions[sid]
+	d.sessionsMu.RUnlock()
 	if !ok {
 		writeError(w, http.StatusNotFound, "upload session not found")
 		return
@@ -576,7 +579,7 @@ func (d *driveAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	uploadSessionsMu.Lock()
+	d.sessionsMu.Lock()
 	session.Chunks = append(session.Chunks, registeredChunk{
 		Index:         ordinal,
 		BlobKey:       blobKey,
@@ -585,7 +588,7 @@ func (d *driveAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 		PlaintextLen:  body.PlaintextLen,
 		CiphertextLen: body.CiphertextLen,
 	})
-	uploadSessionsMu.Unlock()
+	d.sessionsMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]string{"blob_key": blobKey})
 }

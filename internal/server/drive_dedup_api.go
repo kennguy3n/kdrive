@@ -50,10 +50,48 @@ type memContentChunk struct {
 }
 
 var (
-	memContentStore  = map[string]*memContentEntry{}  // content_id → entry
-	memContentChunks = map[string][]memContentChunk{} // content_id → chunks
-	memContentMu     sync.RWMutex
+	memContentStore    = map[string]*memContentEntry{}  // content_id → entry
+	memContentChunks   = map[string][]memContentChunk{} // content_id → chunks
+	memContentMu       sync.RWMutex
+	memContentStoreMax = 10000 // max entries before eviction
 )
+
+// putMemContent inserts a content entry and its chunks into the in-memory
+// stores, evicting a random entry if the store has reached its size limit.
+// Caller must NOT hold memContentMu.
+func putMemContent(key string, entry *memContentEntry, chunks []memContentChunk) {
+	memContentMu.Lock()
+	defer memContentMu.Unlock()
+	if len(memContentStore) >= memContentStoreMax {
+		// Evict a random entry (map iteration order is randomized in Go).
+		for k := range memContentStore {
+			delete(memContentStore, k)
+			delete(memContentChunks, k)
+			break
+		}
+	}
+	memContentStore[key] = entry
+	memContentChunks[key] = chunks
+}
+
+// getMemContent retrieves a content entry from the in-memory store.
+// Caller must NOT hold memContentMu. The returned entry is a snapshot;
+// callers should not mutate it.
+func getMemContent(key string) (*memContentEntry, bool) {
+	memContentMu.RLock()
+	defer memContentMu.RUnlock()
+	entry, ok := memContentStore[key]
+	return entry, ok
+}
+
+// getMemContentChunks retrieves the chunks for a content entry from the
+// in-memory store. Caller must NOT hold memContentMu.
+func getMemContentChunks(key string) ([]memContentChunk, bool) {
+	memContentMu.RLock()
+	defer memContentMu.RUnlock()
+	chunks, ok := memContentChunks[key]
+	return chunks, ok
+}
 
 // contentChunkEntry is the JSON shape for chunk registration requests.
 type contentChunkEntry struct {
@@ -127,9 +165,7 @@ func (d *driveAPI) handleContentCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// In-memory fallback (dev mode)
-	memContentMu.RLock()
-	entry, ok := memContentStore[body.ContentID]
-	memContentMu.RUnlock()
+	entry, ok := getMemContent(body.ContentID)
 
 	if !ok || entry.TenantID != tenantID {
 		writeJSON(w, http.StatusOK, map[string]any{"exists": false})
@@ -199,17 +235,15 @@ func (d *driveAPI) handleContentCheckChunks(w http.ResponseWriter, r *http.Reque
 
 	// In-memory fallback (dev mode)
 	knownHashes := map[string]string{} // hash → blob_key
-	memContentMu.RLock()
-	chunks, ok := memContentChunks[body.ContentID]
+	chunks, ok := getMemContentChunks(body.ContentID)
 	if ok {
-		entry := memContentStore[body.ContentID]
+		entry, _ := getMemContent(body.ContentID)
 		if entry != nil && entry.TenantID == tenantID {
 			for _, c := range chunks {
 				knownHashes[c.ChunkContentHash] = c.BlobKey
 			}
 		}
 	}
-	memContentMu.RUnlock()
 
 	results := make([]map[string]any, 0, len(body.ChunkHashes))
 	for _, hash := range body.ChunkHashes {
@@ -334,10 +368,7 @@ func (d *driveAPI) handleContentRegister(w http.ResponseWriter, r *http.Request)
 	}
 
 	// In-memory fallback (dev mode)
-	memContentMu.Lock()
-	defer memContentMu.Unlock()
-
-	if existing, ok := memContentStore[body.ContentID]; ok {
+	if existing, ok := getMemContent(body.ContentID); ok {
 		if existing.TenantID != tenantID {
 			writeError(w, http.StatusForbidden, "content_id owned by another tenant")
 			return
@@ -365,7 +396,7 @@ func (d *driveAPI) handleContentRegister(w http.ResponseWriter, r *http.Request)
 		})
 	}
 
-	memContentStore[body.ContentID] = &memContentEntry{
+	putMemContent(body.ContentID, &memContentEntry{
 		ContentID:        body.ContentID,
 		TenantID:         tenantID,
 		PlaintextSize:    body.PlaintextSize,
@@ -375,8 +406,7 @@ func (d *driveAPI) handleContentRegister(w http.ResponseWriter, r *http.Request)
 		BlobKeys:         blobKeys,
 		CiphertextHashes: ciphertextHashes,
 		CreatedAt:        time.Now(),
-	}
-	memContentChunks[body.ContentID] = memChunks
+	}, memChunks)
 
 	d.gw.logger.Info("drive: registered content",
 		slog.String("content_id", body.ContentID),
@@ -470,10 +500,8 @@ func (d *driveAPI) handleUploadCommitDedup(w http.ResponseWriter, r *http.Reques
 		_ = entry // entry verified to exist and belong to tenant
 	} else {
 		// In-memory fallback (dev mode)
-		memContentMu.RLock()
-		entry, ok := memContentStore[body.ContentID]
+		entry, ok := getMemContent(body.ContentID)
 		if !ok || entry.TenantID != tenantID {
-			memContentMu.RUnlock()
 			writeError(w, http.StatusBadRequest, "content_id not registered")
 			return
 		}
@@ -481,7 +509,6 @@ func (d *driveAPI) handleUploadCommitDedup(w http.ResponseWriter, r *http.Reques
 		for _, k := range entry.BlobKeys {
 			knownBlobs[k] = true
 		}
-		memContentMu.RUnlock()
 
 		for _, k := range body.ReusedBlobKeys {
 			if !knownBlobs[k] {

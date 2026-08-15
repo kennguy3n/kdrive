@@ -296,15 +296,32 @@ func (j *PurgeJob) runOnce(ctx context.Context) {
 		j.logger.Debug("purge: store does not implement BlobInventory")
 		return
 	}
-	page, err := inventory.ListMultipartUploads(ctx, blobstore.ListUploadsRequest{
-		MaxKeys: 1000,
-	})
-	if err != nil {
-		j.logger.Error("purge: list multipart uploads",
-			slog.Any("err", err))
-		return
+
+	// Paginate through all in-progress multipart uploads.
+	totalUploads := 0
+	cursor := ""
+	for {
+		if ctx.Err() != nil {
+			j.logger.Debug("purge: cancelled during pagination")
+			return
+		}
+		page, err := inventory.ListMultipartUploads(ctx, blobstore.ListUploadsRequest{
+			MaxKeys: 1000,
+			Cursor:  cursor,
+		})
+		if err != nil {
+			j.logger.Error("purge: list multipart uploads",
+				slog.Any("err", err))
+			return
+		}
+		totalUploads += len(page.Uploads)
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
 	}
-	if len(page.Uploads) == 0 {
+
+	if totalUploads == 0 {
 		return
 	}
 	// ListMultipartUploads does not return upload creation time,
@@ -316,7 +333,7 @@ func (j *PurgeJob) runOnce(ctx context.Context) {
 	// observability but do NOT abort — aborting would kill
 	// legitimate active uploads being written by clients.
 	j.logger.Info("purge: found in-progress multipart uploads",
-		slog.Int("count", len(page.Uploads)),
+		slog.Int("count", totalUploads),
 		slog.String("note", "abort deferred until upload_sessions cross-reference is implemented"))
 }
 

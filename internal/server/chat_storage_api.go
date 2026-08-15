@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -162,16 +163,29 @@ func (c *chatStorageAPI) handleArchiveSegment(w http.ResponseWriter, r *http.Req
 
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 256<<20)) // 256 MB max
+		// Stream to a temp file to avoid buffering 256MB in memory.
+		tmpFile, err := os.CreateTemp("", "kdrive-upload-*")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create temp file"})
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		n, err := io.Copy(tmpFile, io.LimitReader(r.Body, 256<<20)) // 256 MB max
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to seek temp file"})
 			return
 		}
 		objRef := fmt.Sprintf("%schat-archive/segments/%s", tenantPrefix(tenant), segmentID)
 		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
 			Key:            objRef,
-			Body:           bytes.NewReader(body),
-			ExpectedLength: int64(len(body)),
+			Body:           tmpFile,
+			ExpectedLength: n,
 		})
 		if err != nil {
 			c.logger.Error("archive segment upload failed", "segment_id", segmentID, "err", err)
@@ -396,16 +410,29 @@ func (c *chatStorageAPI) handleBackupSegment(w http.ResponseWriter, r *http.Requ
 
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 256<<20)) // 256 MB max
+		// Stream to a temp file to avoid buffering 256MB in memory.
+		tmpFile, err := os.CreateTemp("", "kdrive-upload-*")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create temp file"})
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		n, err := io.Copy(tmpFile, io.LimitReader(r.Body, 256<<20)) // 256 MB max
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to seek temp file"})
 			return
 		}
 		objRef := fmt.Sprintf("%schat-backup/segments/%s", tenantPrefix(tenant), segmentID)
 		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
 			Key:            objRef,
-			Body:           bytes.NewReader(body),
-			ExpectedLength: int64(len(body)),
+			Body:           tmpFile,
+			ExpectedLength: n,
 		})
 		if err != nil {
 			c.logger.Error("backup segment upload failed", "segment_id", segmentID, "err", err)
@@ -463,16 +490,29 @@ func (c *chatStorageAPI) handleMediaBlob(w http.ResponseWriter, r *http.Request)
 
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 256<<20)) // 256 MB max
+		// Stream to a temp file to avoid buffering 256MB in memory.
+		tmpFile, err := os.CreateTemp("", "kdrive-upload-*")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create temp file"})
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		n, err := io.Copy(tmpFile, io.LimitReader(r.Body, 256<<20)) // 256 MB max
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to seek temp file"})
 			return
 		}
 		objRef := fmt.Sprintf("%schat-media/%s", tenantPrefix(tenant), blobID)
 		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
 			Key:            objRef,
-			Body:           bytes.NewReader(body),
-			ExpectedLength: int64(len(body)),
+			Body:           tmpFile,
+			ExpectedLength: n,
 		})
 		if err != nil {
 			c.logger.Error("media blob upload failed", "blob_id", blobID, "err", err)

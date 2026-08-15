@@ -51,7 +51,11 @@ func run(args []string) error {
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
+		MaxHeaderBytes:    1 << 20, // 1 MB
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
