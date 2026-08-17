@@ -67,6 +67,9 @@ func NewMemoryCache(policy EvictionPolicy) (*MemoryCache, error) {
 
 // Get returns a reader for the cached blob, or ErrCacheMiss.
 func (c *MemoryCache) Get(_ context.Context, blobID string) (io.ReadCloser, Metadata, error) {
+	if blobID == "" {
+		return nil, Metadata{}, errors.New("hotcache: blob_id is required")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.index[blobID]
@@ -99,8 +102,10 @@ func (c *MemoryCache) Get(_ context.Context, blobID string) (io.ReadCloser, Meta
 		Pinned:       entry.pinned,
 		NonEvictable: entry.nonEvictable,
 	}
-	// Return a copy so the caller cannot mutate the cached body.
-	return io.NopCloser(bytes.NewReader(append([]byte(nil), entry.body...))), md, nil
+	// The cache body is immutable after Put, so return a reader over
+	// the original bytes directly. bytes.NewReader is read-only and
+	// the entry body is never mutated, so no defensive copy is needed.
+	return io.NopCloser(bytes.NewReader(entry.body)), md, nil
 }
 
 // Put stores a blob in the cache.

@@ -4,7 +4,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -237,9 +236,22 @@ func (c *chatStorageAPI) handleArchiveManifests(w http.ResponseWriter, r *http.R
 
 	switch r.Method {
 	case http.MethodPost, http.MethodPut:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20)) // 16 MB max
+		// Stream to a temp file to avoid buffering the entire body in memory.
+		tmpFile, err := os.CreateTemp("", "kdrive-upload-*")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create temp file"})
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		n, err := io.Copy(tmpFile, io.LimitReader(r.Body, 16<<20)) // 16 MB max
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to seek temp file"})
 			return
 		}
 		// Generate a manifest ID from content hash or timestamp.
@@ -247,8 +259,8 @@ func (c *chatStorageAPI) handleArchiveManifests(w http.ResponseWriter, r *http.R
 		objKey := fmt.Sprintf("%schat-archive/manifests/%s", tenantPrefix(tenant), manifestID)
 		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
 			Key:            objKey,
-			Body:           bytes.NewReader(body),
-			ExpectedLength: int64(len(body)),
+			Body:           tmpFile,
+			ExpectedLength: n,
 		})
 		if err != nil {
 			c.logger.Error("archive manifest upload failed", "manifest_id", manifestID, "err", err)
@@ -295,16 +307,29 @@ func (c *chatStorageAPI) handleSearchShard(w http.ResponseWriter, r *http.Reques
 
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20)) // 64 MB max
+		// Stream to a temp file to avoid buffering the entire body in memory.
+		tmpFile, err := os.CreateTemp("", "kdrive-upload-*")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create temp file"})
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		n, err := io.Copy(tmpFile, io.LimitReader(r.Body, 64<<20)) // 64 MB max
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to seek temp file"})
 			return
 		}
 		objKey := fmt.Sprintf("%schat-search/shards/%s", tenantPrefix(tenant), shardKey)
 		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
 			Key:            objKey,
-			Body:           bytes.NewReader(body),
-			ExpectedLength: int64(len(body)),
+			Body:           tmpFile,
+			ExpectedLength: n,
 		})
 		if err != nil {
 			c.logger.Error("search shard upload failed", "shard_key", shardKey, "err", err)
@@ -356,17 +381,30 @@ func (c *chatStorageAPI) handleBackupManifests(w http.ResponseWriter, r *http.Re
 
 	switch r.Method {
 	case http.MethodPost, http.MethodPut:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20)) // 16 MB max
+		// Stream to a temp file to avoid buffering the entire body in memory.
+		tmpFile, err := os.CreateTemp("", "kdrive-upload-*")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create temp file"})
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		n, err := io.Copy(tmpFile, io.LimitReader(r.Body, 16<<20)) // 16 MB max
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+			return
+		}
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to seek temp file"})
 			return
 		}
 		manifestID := fmt.Sprintf("backup-%d", time.Now().UnixNano())
 		objKey := fmt.Sprintf("%schat-backup/manifests/%s", tenantPrefix(tenant), manifestID)
 		_, err = c.gw.store.Put(ctx, blobstore.PutRequest{
 			Key:            objKey,
-			Body:           bytes.NewReader(body),
-			ExpectedLength: int64(len(body)),
+			Body:           tmpFile,
+			ExpectedLength: n,
 		})
 		if err != nil {
 			c.logger.Error("backup manifest upload failed", "manifest_id", manifestID, "err", err)

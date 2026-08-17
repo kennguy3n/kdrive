@@ -191,21 +191,26 @@ goroutines (see [Worker Jobs](#worker-jobs)). Reads `blob_placements` and
   Once the worker promotes them to `COMMITTED_DURABLE`, the entry is
   re-put with `NonEvictable=false`.
 
-### L2 — Durable Origin (Wasabi)
+### L2 — Durable Origin (S3-compatible)
 
 - **Interface**: `pkg/blobstore.BlobStore` — `Put`, `Head`, `Get`,
   `Delete`, `PurgeAllVersions`, multipart operations, retention,
   `Capabilities`.
 - **Dev**: `local_fs_dev` adapter at `/tmp/kchat-drive-dev`.
-- **Production**: `wasabi` adapter using AWS SDK v2 (S3-compatible API).
+- **Production**: `s3` adapter using AWS SDK v2. Supports any
+  S3-compatible provider (Wasabi, AWS S3, Backblaze B2) selected via
+  the `storage.provider` config field.
 - **Content**: ciphertext only, opaque object keys (no
   tenant/user/file/folder IDs).
 - **Integrity**: KChat SHA-256 is authoritative; provider ETags are never
   used as the integrity check (§13.3).
-- **Versioning**: Wasabi bucket versioning enabled (no Object Lock in
-  phase 1).
-- **Min storage duration**: Wasabi's 90-day minimum applies; short-TTL
-  objects must never reach Wasabi (the gateway routes them to L1 only).
+- **Versioning**: bucket versioning enabled (no Object Lock in
+  phase 1). Wasabi and AWS S3 support Object Lock; B2 does not via
+  the S3 API.
+- **Min storage duration**: Wasabi's 90-day minimum applies when
+  `provider=wasabi`; AWS S3 and B2 have no minimum. Short-TTL objects
+  must never reach a provider with a min-storage duration (the gateway
+  routes them to L1 only).
 
 ### Metadata — Postgres
 
@@ -466,7 +471,7 @@ Trusted reconciliation interface (not client-facing):
 | Adapter | Package | Use |
 | --- | --- | --- |
 | `local_fs_dev` | `pkg/blobstore/local_fs_dev` | Dev/CI — filesystem at `/tmp/kchat-drive-dev` |
-| `wasabi` | `pkg/blobstore/wasabi` | Production — AWS SDK v2, S3-compatible |
+| `s3` | `pkg/blobstore/s3` | Production — AWS SDK v2, S3-compatible (Wasabi, AWS S3, Backblaze B2) |
 | `mock` | `pkg/blobstore/mock` | Tests |
 
 ### Error Taxonomy
@@ -497,10 +502,11 @@ Clear`, `LegalHoldSetClear`, `GovernanceBypassDenied`, `Lifecycle`,
 
 ### Circuit Breaker
 
-Optional (`wasabi_circuit_breaker_enabled`, default false). After N
+Optional (`storage_circuit_breaker_enabled`, default false). After N
 consecutive failures (default 10) the breaker opens and fails-fast all
-Wasabi requests. A probe after 30 seconds closes the breaker if it
-succeeds. Implemented in `pkg/blobstore/wasabi/circuit_breaker.go`.
+storage backend requests. A probe after 30 seconds closes the breaker
+if it succeeds. Implemented in
+`pkg/blobstore/s3/circuit_breaker.go`.
 
 ### Conformance Suite
 
@@ -540,18 +546,26 @@ temp files are not orphaned during graceful shutdown.
 `DefaultEvictionPolicy(maxBytes)` returns `EvictionLRUHotPin` with a 10%
 hot region and `HotDemotionHitCount = 1`.
 
-## Wasabi Guardrails
+## Storage Guardrails
 
-`pkg/wasabiguardrails/guardrails.go` — declarative types enforcing
-Wasabi's fair-use policy:
+`pkg/storageguardrails/guardrails.go` — declarative types enforcing
+per-provider fair-use policies. Each provider has a `ProviderProfile`
+selected by `ProfileFor(providerName)`:
+
+- **Wasabi**: 90-day min storage (`WasabiMinStorageDays`), egress ratio
+  1.0×, $6.99/TB-month.
+- **AWS S3**: no min storage, no fair-use egress constraint, standard
+  pricing.
+- **Backblaze B2**: no min storage, generous egress (10×), $6/TB-month.
 
 - **Fair-use constraint**: per-tenant monthly egress ≤ per-tenant active
-  storage volume.
-- **Min storage duration**: 90 days (`WasabiMinStorageDays`). Short-TTL
-  objects must never reach Wasabi.
+  storage volume × `EgressStorageRatio`.
+- **Min storage duration**: provider-specific (Wasabi: 90 days, S3/B2: 0).
+  Short-TTL objects must never reach a provider with a min-storage
+  duration.
 - **Egress budget**: `FairUseEgressBudget` replenishes monthly, sized to
-  stored bytes × `EgressStorageRatio` (default 1.0). `SoftCapBytes`
-  warns; `HardCapBytes` triggers `ThrottlePolicy` (default
+  stored bytes × `EgressStorageRatio`. `SoftCapBytes` warns;
+  `HardCapBytes` triggers `ThrottlePolicy` (default
   `slowdown_origin_reads`).
 - **Cache hit ratio**: `CacheHitRatioTarget.Min = 0.9` over a 30-day
   window — keeps egress under budget.

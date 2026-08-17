@@ -16,7 +16,7 @@ import (
 	"github.com/kchat/drive/internal/metadata"
 	"github.com/kchat/drive/pkg/blobstore"
 	"github.com/kchat/drive/pkg/blobstore/local_fs_dev"
-	"github.com/kchat/drive/pkg/blobstore/wasabi"
+	"github.com/kchat/drive/pkg/blobstore/s3"
 	"github.com/kchat/drive/pkg/hotcache"
 )
 
@@ -32,7 +32,7 @@ type Gateway struct {
 }
 
 // NewGateway builds the gateway from config. In production it opens
-// a Postgres connection pool, builds the Wasabi adapter, the L1
+// a Postgres connection pool, builds the S3-compatible storage adapter, the L1
 // cache, and the blobio pipeline. In dev mode it uses local_fs_dev
 // and an in-memory cache with no Postgres.
 func NewGateway(cfg *config.GatewayConfig, logger *slog.Logger) (*Gateway, error) {
@@ -59,7 +59,9 @@ func NewGateway(cfg *config.GatewayConfig, logger *slog.Logger) (*Gateway, error
 	// In production, open Postgres and wire the pipeline with a
 	// durable status store. In dev, use an in-memory status store.
 	if cfg.PostgresDSN != "" {
-		db, err := metadata.Open(cfg.PostgresDSN)
+		openCtx, openCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer openCancel()
+		db, err := metadata.Open(openCtx, cfg.PostgresDSN)
 		if err != nil {
 			return nil, fmt.Errorf("server: open postgres: %w", err)
 		}
@@ -74,6 +76,12 @@ func NewGateway(cfg *config.GatewayConfig, logger *slog.Logger) (*Gateway, error
 			return nil, fmt.Errorf("server: auto-migrate: %w", err)
 		}
 		migrateCancel()
+		// Prepare hot query statements now that the schema is migrated.
+		stmtsCtx, stmtsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := g.metaDB.InitStmts(stmtsCtx); err != nil {
+			logger.Warn("server: prepare hot statements (non-fatal)", "err", err)
+		}
+		stmtsCancel()
 		statusStore := metadata.NewStatusStore(db)
 		g.pipeline = blobio.NewWithStatusStore(cache, store, statusStore, logger)
 	} else {
@@ -83,32 +91,27 @@ func NewGateway(cfg *config.GatewayConfig, logger *slog.Logger) (*Gateway, error
 }
 
 func buildStore(cfg *config.GatewayConfig) (blobstore.BlobStore, error) {
-	if cfg.Env != "production" || cfg.Wasabi.Endpoint == "" {
+	if cfg.Env != "production" || cfg.Storage.Endpoint == "" {
 		root := "/tmp/kchat-drive-dev"
 		return local_fs_dev.New(root)
 	}
-	if cfg.WasabiCircuitBreakerEnabled {
-		threshold := cfg.WasabiCircuitBreakerThreshold
+	s3cfg := s3.Config{
+		ProviderName: cfg.Storage.Provider,
+		Endpoint:     cfg.Storage.Endpoint,
+		Region:       cfg.Storage.Region,
+		Bucket:       cfg.Storage.Bucket,
+		AccessKey:    cfg.Storage.AccessKey,
+		SecretKey:    cfg.Storage.SecretKey,
+		UsePathStyle: cfg.Storage.UsePathStyle,
+	}
+	if cfg.StorageCircuitBreakerEnabled {
+		threshold := cfg.StorageCircuitBreakerThreshold
 		if threshold <= 0 {
 			threshold = 10
 		}
-		return wasabi.NewWithCircuitBreaker(wasabi.Config{
-			Endpoint:     cfg.Wasabi.Endpoint,
-			Region:       cfg.Wasabi.Region,
-			Bucket:       cfg.Wasabi.Bucket,
-			AccessKey:    cfg.Wasabi.AccessKey,
-			SecretKey:    cfg.Wasabi.SecretKey,
-			UsePathStyle: cfg.Wasabi.UsePathStyle,
-		}, threshold, 30*time.Second)
+		return s3.NewWithCircuitBreaker(s3cfg, threshold, 30*time.Second)
 	}
-	return wasabi.New(wasabi.Config{
-		Endpoint:     cfg.Wasabi.Endpoint,
-		Region:       cfg.Wasabi.Region,
-		Bucket:       cfg.Wasabi.Bucket,
-		AccessKey:    cfg.Wasabi.AccessKey,
-		SecretKey:    cfg.Wasabi.SecretKey,
-		UsePathStyle: cfg.Wasabi.UsePathStyle,
-	})
+	return s3.New(s3cfg)
 }
 
 func buildCache(cfg *config.GatewayConfig) (hotcache.Cache, error) {
@@ -175,7 +178,7 @@ func (g *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check Wasabi connectivity with a lightweight HeadBucket.
+	// Check storage backend connectivity with a lightweight HeadBucket.
 	// This is a no-op in dev mode (local_fs_dev doesn't have a
 	// HeadBucket, but it's always "ready" since it's local disk).
 	if g.store != nil {
@@ -190,7 +193,7 @@ func (g *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkStoreReady does a lightweight readiness check against the
-// durable store. For Wasabi this would be HeadBucket; for local_fs_dev
+// durable store. For S3-compatible backends this would be HeadBucket; for local_fs_dev
 // it's always ready.
 func (g *Gateway) checkStoreReady(ctx context.Context) bool {
 	// We use a Head on a known non-existent key with a short timeout.
@@ -201,7 +204,12 @@ func (g *Gateway) checkStoreReady(ctx context.Context) bool {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		_, err := g.store.Head(ctx, blobstore.ObjectRef{Key: "__readyz_probe__"})
+		// Use a short independent timeout so the goroutine does not
+		// leak if the caller's context has a long deadline or is
+		// never cancelled.
+		headCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, err := g.store.Head(headCtx, blobstore.ObjectRef{Key: "__readyz_probe__"})
 		ch <- result{err: err}
 	}()
 	select {

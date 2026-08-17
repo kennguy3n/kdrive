@@ -15,6 +15,15 @@ import (
 	"time"
 )
 
+// diskWriteBufPool reuses 128 KB write buffers across Put calls to
+// avoid repeated allocation and GC pressure on large blob writes.
+var diskWriteBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 128*1024)
+		return &b
+	},
+}
+
 // DiskCache is an NVMe / block-storage backed Cache.
 //
 // Blob bodies are written to {RootPath}/{shard}/{blobID}.bin and
@@ -114,6 +123,9 @@ func NewDiskCache(cfg DiskCacheConfig) (*DiskCache, error) {
 
 // Get returns a reader for the cached blob, or ErrCacheMiss.
 func (c *DiskCache) Get(_ context.Context, blobID string) (io.ReadCloser, Metadata, error) {
+	if err := validateBlobID(blobID); err != nil {
+		return nil, Metadata{}, err
+	}
 	c.mu.Lock()
 	el, ok := c.index[blobID]
 	if !ok {
@@ -169,8 +181,8 @@ func (c *DiskCache) Get(_ context.Context, blobID string) (io.ReadCloser, Metada
 
 // Put stores a blob in the cache.
 func (c *DiskCache) Put(_ context.Context, blobID string, r io.Reader, opts PutOptions) error {
-	if blobID == "" {
-		return errors.New("hotcache: blob_id is required")
+	if err := validateBlobID(blobID); err != nil {
+		return err
 	}
 	if r == nil {
 		return errors.New("hotcache: reader is required")
@@ -186,7 +198,12 @@ func (c *DiskCache) Put(_ context.Context, blobID string, r io.Reader, opts PutO
 		return fmt.Errorf("hotcache: create temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
-	size, copyErr := io.Copy(tmp, r)
+	// Use a pooled 128 KB buffer instead of the default 32 KB to
+	// reduce syscall overhead on large blob writes.
+	bufPtr := diskWriteBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer diskWriteBufPool.Put(bufPtr)
+	size, copyErr := io.CopyBuffer(tmp, r, buf)
 	closeErr := tmp.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmpPath)
@@ -226,6 +243,12 @@ func (c *DiskCache) Put(_ context.Context, blobID string, r io.Reader, opts PutO
 	}
 	c.evictMainLocked(size)
 	bodyPath := c.bodyPath(blobID)
+	// fsync the temp file before rename so the body is durable on
+	// disk before the atomic publish.
+	if f, ferr := os.OpenFile(tmpPath, os.O_WRONLY, 0o644); ferr == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
 	if err := os.Rename(tmpPath, bodyPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("hotcache: publish body: %w", err)
@@ -383,6 +406,22 @@ func (c *DiskCache) removeLocked(el *list.Element) {
 	_ = os.Remove(c.metaPath(entry.blobID))
 }
 
+// validateBlobID rejects blobIDs that could escape the cache root
+// via path traversal. BlobIDs are expected to be opaque hex or
+// base64 content-addressed keys.
+func validateBlobID(blobID string) error {
+	if blobID == "" {
+		return errors.New("hotcache: blobID is required")
+	}
+	if strings.ContainsAny(blobID, `/\`) {
+		return fmt.Errorf("hotcache: blobID %q must not contain path separators", blobID)
+	}
+	if blobID == "." || blobID == ".." || strings.Contains(blobID, "..") {
+		return fmt.Errorf("hotcache: blobID %q must not be a relative path component", blobID)
+	}
+	return nil
+}
+
 func (c *DiskCache) shardDir(blobID string) string {
 	return filepath.Join(c.root, shardOf(blobID))
 }
@@ -419,6 +458,12 @@ func writeMeta(path string, e *diskEntry) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, body, 0o644); err != nil {
 		return fmt.Errorf("hotcache: write meta: %w", err)
+	}
+	// fsync the temp file before rename so the metadata is durable
+	// on disk before the atomic publish.
+	if f, ferr := os.OpenFile(tmp, os.O_WRONLY, 0o644); ferr == nil {
+		_ = f.Sync()
+		_ = f.Close()
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

@@ -21,12 +21,73 @@ import (
 // Store is the Postgres metadata store.
 type Store struct {
 	db *sql.DB
+
+	// preparedStmts caches prepared statements for the most frequently
+	// called read queries. They are prepared once via InitStmts and
+	// reused across requests to avoid repeated parse/plan work in
+	// Postgres. Individual statements may be nil if preparation failed
+	// or InitStmts was never called; query methods fall back to inline
+	// queries in that case.
+	preparedStmts
+}
+
+// preparedStmts holds prepared statements for hot read queries.
+type preparedStmts struct {
+	getTenant           *sql.Stmt
+	getFolder           *sql.Stmt
+	getNode             *sql.Stmt
+	getEncryptionDomain *sql.Stmt
+}
+
+// InitStmts prepares the most frequently called queries. It is
+// best-effort: if a particular statement cannot be prepared (e.g. the
+// table does not exist yet during migration), that statement is left
+// nil and the corresponding query method falls back to an inline
+// query. Call this once after New, once the schema has been migrated.
+func (s *Store) InitStmts(ctx context.Context) error {
+	type stmtDef struct {
+		query string
+		dest  **sql.Stmt
+	}
+	defs := []stmtDef{
+		{
+			query: `SELECT id, pool_id, privacy_mode, guardrails, created_at FROM tenants WHERE id = $1`,
+			dest:  &s.getTenant,
+		},
+		{
+			query: `SELECT id, tenant_id, COALESCE(parent_folder_id, ''), name_encrypted, privacy_mode, created_at
+			 FROM folders WHERE id = $1 AND deleted_at IS NULL`,
+			dest: &s.getFolder,
+		},
+		{
+			query: `SELECT id, tenant_id, folder_id, name_encrypted, mime_type, created_at, updated_at
+			 FROM nodes WHERE id = $1 AND deleted_at IS NULL`,
+			dest: &s.getNode,
+		},
+		{
+			query: `SELECT id, tenant_id, COALESCE(folder_id, ''), privacy_mode, generation,
+			        prev_generation, prev_key_envelope, created_at, rotated_at
+			 FROM encryption_domains WHERE id = $1 AND tenant_id = $2`,
+			dest: &s.getEncryptionDomain,
+		},
+	}
+	for _, d := range defs {
+		stmt, err := s.db.PrepareContext(ctx, d.query)
+		if err != nil {
+			// Leave this statement nil; the query method will fall
+			// back to an inline query.
+			continue
+		}
+		*d.dest = stmt
+	}
+	return nil
 }
 
 // Open opens a Postgres connection pool from a DSN and tunes it for
 // the worker/gateway workload. The pool limits are conservative for
 // a single-VM-pool deployment with 2 gateway replicas + 1 worker.
-func Open(dsn string) (*sql.DB, error) {
+// A Ping is performed to verify connectivity before returning.
+func Open(ctx context.Context, dsn string) (*sql.DB, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("metadata: open: %w", err)
@@ -38,6 +99,11 @@ func Open(dsn string) (*sql.DB, error) {
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	db.SetConnMaxIdleTime(5 * time.Minute)
+	// Verify connectivity so callers fail fast on misconfigured DSNs.
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("metadata: ping: %w", err)
+	}
 	return db, nil
 }
 
@@ -127,8 +193,13 @@ func (s *Store) CreateTenant(ctx context.Context, t Tenant) error {
 
 // GetTenant fetches a tenant by ID.
 func (s *Store) GetTenant(ctx context.Context, id string) (*Tenant, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, pool_id, privacy_mode, guardrails, created_at FROM tenants WHERE id = $1`, id)
+	var row *sql.Row
+	if s.getTenant != nil {
+		row = s.getTenant.QueryRowContext(ctx, id)
+	} else {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT id, pool_id, privacy_mode, guardrails, created_at FROM tenants WHERE id = $1`, id)
+	}
 	var t Tenant
 	if err := row.Scan(&t.ID, &t.PoolID, &t.PrivacyMode, &t.Guardrails, &t.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

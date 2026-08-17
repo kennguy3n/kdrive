@@ -5,10 +5,11 @@
 #
 # Dumps the metadata database with pg_dump (run inside the postgres
 # container so no client install is needed on the host), compresses
-# it, and uploads it to Wasabi under
-# s3://$WASABI_BUCKET/backups/postgres/. Wasabi is S3-compatible, so
-# the standard aws CLI works against it with --endpoint-url. Old
-# backups beyond the retention window are pruned.
+# it, and uploads it to the configured S3-compatible storage backend
+# under s3://$STORAGE_BUCKET/backups/postgres/. The storage backend
+# is S3-compatible (Wasabi, AWS S3, or Backblaze B2), so the standard
+# aws CLI works against it with --endpoint-url. Old backups beyond
+# the retention window are pruned.
 #
 # Ported from zk-object-fabric/deploy/sme/backup.sh, adapted for
 # KChat Drive's container and bucket names.
@@ -35,11 +36,13 @@ set +a
 
 : "${POSTGRES_USER:=postgres}"
 : "${POSTGRES_DB:=kdrive}"
-: "${WASABI_BUCKET:?WASABI_BUCKET must be set in .env}"
-: "${WASABI_ENDPOINT:?WASABI_ENDPOINT must be set in .env}"
-: "${WASABI_REGION:?WASABI_REGION must be set in .env}"
-: "${WASABI_ACCESS_KEY:?WASABI_ACCESS_KEY must be set in .env}"
-: "${WASABI_SECRET_KEY:?WASABI_SECRET_KEY must be set in .env}"
+# Storage backend config: prefer STORAGE_* vars, fall back to WASABI_*
+# for backwards compatibility with existing .env files.
+: "${STORAGE_BUCKET:=${WASABI_BUCKET:?WASABI_BUCKET or STORAGE_BUCKET must be set in .env}}"
+: "${STORAGE_ENDPOINT:=${WASABI_ENDPOINT:?WASABI_ENDPOINT or STORAGE_ENDPOINT must be set in .env}}"
+: "${STORAGE_REGION:=${WASABI_REGION:?WASABI_REGION or STORAGE_REGION must be set in .env}}"
+: "${STORAGE_ACCESS_KEY:=${WASABI_ACCESS_KEY:?WASABI_ACCESS_KEY or STORAGE_ACCESS_KEY must be set in .env}}"
+: "${STORAGE_SECRET_KEY:=${WASABI_SECRET_KEY:?WASABI_SECRET_KEY or STORAGE_SECRET_KEY must be set in .env}}"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 workdir="$(mktemp -d)"
@@ -62,14 +65,14 @@ echo "backup: wrote $dump_file ($size bytes)"
 # Wasabi auth reuses the bucket credentials as AWS-style creds for
 # this invocation only — exported into the environment, never
 # written to disk.
-export AWS_ACCESS_KEY_ID="$WASABI_ACCESS_KEY"
-export AWS_SECRET_ACCESS_KEY="$WASABI_SECRET_KEY"
-export AWS_DEFAULT_REGION="$WASABI_REGION"
-endpoint="https://$WASABI_ENDPOINT"
+export AWS_ACCESS_KEY_ID="$STORAGE_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$STORAGE_SECRET_KEY"
+export AWS_DEFAULT_REGION="$STORAGE_REGION"
+endpoint="https://$STORAGE_ENDPOINT"
 key="backups/postgres/kdrive-$timestamp.sql.gz"
 
-echo "backup: uploading to s3://$WASABI_BUCKET/$key ..."
-aws --endpoint-url "$endpoint" s3 cp "$dump_file" "s3://$WASABI_BUCKET/$key"
+echo "backup: uploading to s3://$STORAGE_BUCKET/$key ..."
+aws --endpoint-url "$endpoint" s3 cp "$dump_file" "s3://$STORAGE_BUCKET/$key"
 
 # Sync WAL archive segments to Wasabi for PITR. The postgres
 # container archives WAL files to the postgres-wal-archive volume
@@ -84,7 +87,7 @@ if [ "$wal_count" -gt 0 ] 2>/dev/null; then
     docker compose -f "$COMPOSE_FILE" exec -T postgres \
         sh -c "tar -cf - -C '$wal_dir' ." \
         | aws --endpoint-url "$endpoint" s3 cp - \
-            "s3://$WASABI_BUCKET/backups/postgres/wal-$timestamp.tar" \
+            "s3://$STORAGE_BUCKET/backups/postgres/wal-$timestamp.tar" \
             --expected-size=$((wal_count * 67108864))
     echo "backup: WAL sync complete."
 else
@@ -100,17 +103,30 @@ cutoff_epoch=$(( $(date -u +%s) - RETENTION_DAYS * 86400 ))
 cutoff="$(date -u -r "$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
     || date -u -d "@$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ)"
 aws --endpoint-url "$endpoint" s3api list-objects-v2 \
-    --bucket "$WASABI_BUCKET" --prefix "backups/postgres/" \
+    --bucket "$STORAGE_BUCKET" --prefix "backups/postgres/" \
     --query "Contents[?LastModified<='$cutoff'].Key" --output text 2>/dev/null \
     | tr '\t' '\n' \
     | while IFS= read -r old_key; do
         case "$old_key" in
             ""|None) continue ;;
         esac
-        echo "backup: removing s3://$WASABI_BUCKET/$old_key"
-        aws --endpoint-url "$endpoint" s3 rm "s3://$WASABI_BUCKET/$old_key"
+        echo "backup: removing s3://$STORAGE_BUCKET/$old_key"
+        aws --endpoint-url "$endpoint" s3 rm "s3://$STORAGE_BUCKET/$old_key"
       done
 
 # Prune old WAL archives (keep only those newer than the oldest
-# retained base backup).
+# retained base backup, i.e., older than the retention cutoff).
+echo "backup: pruning WAL archives older than ${RETENTION_DAYS}d ..."
+aws --endpoint-url "$endpoint" s3api list-objects-v2 \
+    --bucket "$STORAGE_BUCKET" --prefix "backups/postgres/wal-" \
+    --query "Contents[?LastModified<='$cutoff'].Key" --output text 2>/dev/null \
+    | tr '\t' '\n' \
+    | while IFS= read -r old_wal; do
+        case "$old_wal" in
+            ""|None) continue ;;
+        esac
+        echo "backup: removing s3://$STORAGE_BUCKET/$old_wal"
+        aws --endpoint-url "$endpoint" s3 rm "s3://$STORAGE_BUCKET/$old_wal"
+      done
+
 echo "backup: done."

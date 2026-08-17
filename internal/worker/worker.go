@@ -1,10 +1,10 @@
 // Package worker runs the drive-worker background jobs.
 //
 // Jobs (plan §6):
-//   - PromotionJob: promotes CACHED file_versions to Wasabi (COMMITTED_DURABLE).
+//   - PromotionJob: promotes CACHED file_versions to durable storage (COMMITTED_DURABLE).
 //   - RepairJob: samples durable blobs and verifies their checksums.
 //   - PurgeJob: sweeps orphaned multipart uploads and abandoned write intents.
-//   - BackupJob: triggers the nightly pg_dump → Wasabi backup.
+//   - BackupJob: triggers the nightly pg_dump → storage backup.
 //   - GuardrailRollupJob: rolls up per-tenant egress/cache-hit metrics.
 package worker
 
@@ -21,7 +21,7 @@ import (
 	"github.com/kchat/drive/internal/metadata"
 	"github.com/kchat/drive/pkg/blobstore"
 	"github.com/kchat/drive/pkg/blobstore/local_fs_dev"
-	"github.com/kchat/drive/pkg/blobstore/wasabi"
+	"github.com/kchat/drive/pkg/blobstore/s3"
 	"github.com/kchat/drive/pkg/hotcache"
 )
 
@@ -47,7 +47,7 @@ type Job interface {
 // production these are built from config; in tests they are injected
 // directly.
 type Deps struct {
-	Store    blobstore.BlobStore // durable origin (Wasabi or local_fs_dev)
+	Store    blobstore.BlobStore // durable origin (S3-compatible backend or local_fs_dev)
 	Pipeline *blobio.Pipeline    // L1+L2 pipeline for promote/repair
 	MetaDB   *sql.DB             // Postgres for metadata queries
 	Cache    hotcache.Cache      // L1 cache (for repair/restore)
@@ -80,7 +80,7 @@ func New(cfg *config.WorkerConfig, logger *slog.Logger) (*Worker, error) {
 }
 
 // NewWithDeps builds a worker with explicitly injected dependencies.
-// Tests use this to wire fakes without a real Postgres or Wasabi.
+// Tests use this to wire fakes without a real Postgres or storage backend.
 func NewWithDeps(cfg *config.WorkerConfig, deps Deps, logger *slog.Logger) (*Worker, error) {
 	if cfg == nil {
 		return nil, errors.New("worker: config is required")
@@ -102,7 +102,9 @@ func buildDeps(cfg *config.WorkerConfig, logger *slog.Logger) (*Deps, error) {
 	if err != nil {
 		return nil, err
 	}
-	metaDB, err := metadata.Open(cfg.PostgresDSN)
+	openCtx, openCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer openCancel()
+	metaDB, err := metadata.Open(openCtx, cfg.PostgresDSN)
 	if err != nil {
 		return nil, err
 	}
@@ -117,31 +119,26 @@ func buildDeps(cfg *config.WorkerConfig, logger *slog.Logger) (*Deps, error) {
 }
 
 func buildWorkerStore(cfg *config.WorkerConfig) (blobstore.BlobStore, error) {
-	if cfg.Wasabi.Endpoint == "" {
+	if cfg.Storage.Endpoint == "" {
 		return local_fs_dev.New("/tmp/kchat-drive-dev")
 	}
-	if cfg.WasabiCircuitBreakerEnabled {
-		threshold := cfg.WasabiCircuitBreakerThreshold
+	s3cfg := s3.Config{
+		ProviderName: cfg.Storage.Provider,
+		Endpoint:     cfg.Storage.Endpoint,
+		Region:       cfg.Storage.Region,
+		Bucket:       cfg.Storage.Bucket,
+		AccessKey:    cfg.Storage.AccessKey,
+		SecretKey:    cfg.Storage.SecretKey,
+		UsePathStyle: cfg.Storage.UsePathStyle,
+	}
+	if cfg.StorageCircuitBreakerEnabled {
+		threshold := cfg.StorageCircuitBreakerThreshold
 		if threshold <= 0 {
 			threshold = 10
 		}
-		return wasabi.NewWithCircuitBreaker(wasabi.Config{
-			Endpoint:     cfg.Wasabi.Endpoint,
-			Region:       cfg.Wasabi.Region,
-			Bucket:       cfg.Wasabi.Bucket,
-			AccessKey:    cfg.Wasabi.AccessKey,
-			SecretKey:    cfg.Wasabi.SecretKey,
-			UsePathStyle: cfg.Wasabi.UsePathStyle,
-		}, threshold, 30*time.Second)
+		return s3.NewWithCircuitBreaker(s3cfg, threshold, 30*time.Second)
 	}
-	return wasabi.New(wasabi.Config{
-		Endpoint:     cfg.Wasabi.Endpoint,
-		Region:       cfg.Wasabi.Region,
-		Bucket:       cfg.Wasabi.Bucket,
-		AccessKey:    cfg.Wasabi.AccessKey,
-		SecretKey:    cfg.Wasabi.SecretKey,
-		UsePathStyle: cfg.Wasabi.UsePathStyle,
-	})
+	return s3.New(s3cfg)
 }
 
 func buildWorkerCache(cfg *config.WorkerConfig) (hotcache.Cache, error) {
@@ -164,6 +161,11 @@ func (w *Worker) buildJobs(deps Deps) []Job {
 	var meta *metadata.Store
 	if deps.MetaDB != nil {
 		meta = metadata.New(deps.MetaDB)
+		stmtsCtx, stmtsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := meta.InitStmts(stmtsCtx); err != nil {
+			w.logger.Warn("worker: prepare hot statements (non-fatal)", "err", err)
+		}
+		stmtsCancel()
 	}
 	// statusStore is the Postgres-backed blob placement store. It's
 	// nil in dev/test mode; jobs that need it skip gracefully.

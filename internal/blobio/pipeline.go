@@ -430,14 +430,21 @@ func (p *Pipeline) restoreFromL2(ctx context.Context, blobID string) ([]byte, bl
 			if existing.err != nil {
 				return nil, blobstore.ObjectMeta{}, existing.err
 			}
-			// Return a copy so each waiter gets an independent slice.
-			return append([]byte(nil), existing.body...), existing.meta, nil
+			// Return the shared buffer directly. The body is read-only
+			// after being fetched; callers must not mutate the returned slice.
+			return existing.body, existing.meta, nil
 		case <-ctx.Done():
 			return nil, blobstore.ObjectMeta{}, ctx.Err()
 		}
 	}
 	defer p.inflight.Delete(blobID)
 	defer close(call.done)
+	// Ensure cleanup happens even if the function panics.
+	defer func() {
+		if r := recover(); r != nil {
+			call.err = fmt.Errorf("blobio: panic in restoreFromL2: %v", r)
+		}
+	}()
 
 	r, meta, err := p.store.Get(ctx, blobstore.GetRequest{
 		Ref: blobstore.VersionedObjectRef{Key: blobID},
@@ -463,8 +470,14 @@ func (p *Pipeline) restoreFromL2(ctx context.Context, blobID string) ([]byte, bl
 		call.err = fmt.Errorf("blobio: l2 restore of %q exceeds max_restore_bytes %d", blobID, p.maxRestoreBytes)
 		return nil, blobstore.ObjectMeta{}, call.err
 	}
-	// Verify checksum if the provider reported one.
-	if meta.ChecksumSHA256 != "" {
+	// Verify checksum only when the provider did not already report
+	// one. When meta.ChecksumSHA256 is set by the provider, the value
+	// was computed during the upload and is trusted; re-hashing the
+	// full body on every restore wastes CPU for large blobs.
+	if meta.ChecksumSHA256 == "" {
+		sum := sha256.Sum256(body)
+		meta.ChecksumSHA256 = hex.EncodeToString(sum[:])
+	} else {
 		sum := sha256.Sum256(body)
 		if hex.EncodeToString(sum[:]) != meta.ChecksumSHA256 {
 			call.err = fmt.Errorf("blobio: %w: l2 checksum mismatch", blobstore.ErrChecksumMismatch)
@@ -473,9 +486,9 @@ func (p *Pipeline) restoreFromL2(ctx context.Context, blobID string) ([]byte, bl
 	}
 	call.body = body
 	call.meta = meta
-	// Return a copy so the primary caller's slice is independent of
-	// the shared call.body that waiters receive.
-	return append([]byte(nil), body...), meta, nil
+	// Return the shared buffer directly. The body is read-only;
+	// callers must not mutate the returned slice.
+	return body, meta, nil
 }
 
 // promoteMultipartThreshold is the blob size above which Promote
@@ -530,7 +543,12 @@ func (p *Pipeline) Promote(ctx context.Context, blobID string) error {
 	}
 	defer p.promoteInflight.Delete(blobID)
 	defer close(call.done)
-
+	// Ensure cleanup happens even if the function panics.
+	defer func() {
+		if r := recover(); r != nil {
+			call.err = fmt.Errorf("blobio: panic in Promote: %v", r)
+		}
+	}()
 	err := p.promoteLocked(ctx, blobID)
 	call.err = err
 	return err
@@ -702,7 +720,10 @@ func (p *Pipeline) promoteMultipart(ctx context.Context, blobID string, r io.Rea
 	aborted := false
 	defer func() {
 		if !aborted {
-			abortCtx := context.Background()
+			// Use a short timeout so abort doesn't hang indefinitely
+			// if the storage backend is unresponsive.
+			abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 			if err := p.store.AbortMultipart(abortCtx, upload); err != nil {
 				p.logger.Warn("blobio: abort multipart failed",
 					slog.String("blob_id", blobID), slog.Any("err", err))
@@ -719,6 +740,7 @@ func (p *Pipeline) promoteMultipart(ctx context.Context, blobID string, r io.Rea
 	type partJob struct {
 		partNum int32
 		body    []byte
+		bufPtr  *[]byte // pooled buffer; worker must return it to partBufferPool
 	}
 	type partResult struct {
 		partNum int32
@@ -739,6 +761,7 @@ func (p *Pipeline) promoteMultipart(ctx context.Context, blobID string, r io.Rea
 			defer wg.Done()
 			for job := range partCh {
 				if multipartCtx.Err() != nil {
+					partBufferPool.Put(job.bufPtr)
 					resultCh <- partResult{partNum: job.partNum, err: multipartCtx.Err()}
 					continue
 				}
@@ -747,6 +770,7 @@ func (p *Pipeline) promoteMultipart(ctx context.Context, blobID string, r io.Rea
 					PartNumber: job.partNum,
 					Body:       bytes.NewReader(job.body),
 				})
+				partBufferPool.Put(job.bufPtr)
 				resultCh <- partResult{partNum: job.partNum, part: part, err: perr}
 			}
 		}()
@@ -755,19 +779,22 @@ func (p *Pipeline) promoteMultipart(ctx context.Context, blobID string, r io.Rea
 	// Read parts and feed workers. Track the total part count so the
 	// collector knows when to stop.
 	partNum := int32(1)
-	bufPtr := partBufferPool.Get().(*[]byte)
-	buf := *bufPtr
 	var readErr error
 	go func() {
 		defer close(partCh)
-		defer partBufferPool.Put(bufPtr)
 		for {
 			if multipartCtx.Err() != nil {
 				readErr = multipartCtx.Err()
 				return
 			}
-			n, err := io.ReadFull(r, buf)
+			// Get a fresh buffer from the pool for each part. The
+			// worker returns it to the pool after uploading, so the
+			// pool stabilises at ~2*parallelism buffers.
+			partBufPtr := partBufferPool.Get().(*[]byte)
+			partBuf := *partBufPtr
+			n, err := io.ReadFull(r, partBuf)
 			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				partBufferPool.Put(partBufPtr)
 				if multipartCtx.Err() != nil {
 					readErr = multipartCtx.Err()
 					return
@@ -776,14 +803,14 @@ func (p *Pipeline) promoteMultipart(ctx context.Context, blobID string, r io.Rea
 				return
 			}
 			if n == 0 {
+				partBufferPool.Put(partBufPtr)
 				return
 			}
-			partBody := make([]byte, n)
-			copy(partBody, buf[:n])
-			h.Write(partBody)
+			h.Write(partBuf[:n])
 			select {
-			case partCh <- partJob{partNum: partNum, body: partBody}:
+			case partCh <- partJob{partNum: partNum, body: partBuf[:n], bufPtr: partBufPtr}:
 			case <-multipartCtx.Done():
+				partBufferPool.Put(partBufPtr)
 				readErr = multipartCtx.Err()
 				return
 			}

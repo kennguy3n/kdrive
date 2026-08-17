@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/lib/pq"
@@ -138,6 +139,11 @@ func (s *Store) GetContentChunks(ctx context.Context, contentID, tenantID string
 func (s *Store) CreateContentChunks(ctx context.Context, contentID string, chunks []ContentChunk) error {
 	if len(chunks) == 0 {
 		return nil
+	}
+	// Cap batch size to prevent excessively long transactions.
+	const maxChunksPerCall = 10000
+	if len(chunks) > maxChunksPerCall {
+		return fmt.Errorf("metadata: CreateContentChunks: %d chunks exceeds limit of %d", len(chunks), maxChunksPerCall)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

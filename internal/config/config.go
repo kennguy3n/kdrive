@@ -15,24 +15,49 @@ import (
 
 // GatewayConfig is the drive-gateway runtime configuration.
 type GatewayConfig struct {
-	Env         string       `json:"env"`          // "dev" or "production"
-	HTTPAddr    string       `json:"http_addr"`    // ":8080"
-	PostgresDSN string       `json:"postgres_dsn"` // required in production
-	Wasabi      WasabiConfig `json:"wasabi"`
-	Cache       CacheConfig  `json:"cache"`
+	Env         string        `json:"env"`          // "dev" or "production"
+	HTTPAddr    string        `json:"http_addr"`    // ":8080"
+	PostgresDSN string        `json:"postgres_dsn"` // required in production
+	Storage     StorageConfig `json:"storage"`
+	Wasabi      WasabiConfig  `json:"wasabi"` // deprecated: use Storage
+	Cache       CacheConfig   `json:"cache"`
 
 	// --- Circuit breaker (P2-10) ---
 
-	// WasabiCircuitBreakerEnabled turns on the Wasabi circuit breaker.
-	// When enabled, after consecutive failures the breaker opens and
-	// fails-fast requests until a probe succeeds. Default false.
-	WasabiCircuitBreakerEnabled bool `json:"wasabi_circuit_breaker_enabled"`
-	// WasabiCircuitBreakerThreshold is the consecutive failure count
+	// StorageCircuitBreakerEnabled turns on the storage backend circuit
+	// breaker. When enabled, after consecutive failures the breaker
+	// opens and fails-fast requests until a probe succeeds. Default
+	// false.
+	StorageCircuitBreakerEnabled bool `json:"storage_circuit_breaker_enabled"`
+	// StorageCircuitBreakerThreshold is the consecutive failure count
 	// that opens the breaker. Default 10.
-	WasabiCircuitBreakerThreshold int `json:"wasabi_circuit_breaker_threshold"`
+	StorageCircuitBreakerThreshold int `json:"storage_circuit_breaker_threshold"`
+
+	// --- Deprecated circuit breaker fields (backwards compat) ---
+
+	WasabiCircuitBreakerEnabled   bool `json:"wasabi_circuit_breaker_enabled"`
+	WasabiCircuitBreakerThreshold int  `json:"wasabi_circuit_breaker_threshold"`
 }
 
-// WasabiConfig is the Wasabi adapter configuration.
+// StorageConfig is the generic S3-compatible storage backend
+// configuration. The Provider field selects the provider profile
+// ("wasabi", "s3", "b2"). All providers use the same AWS SDK v2 S3
+// client; the profile only affects capability reporting, error
+// prefixes, and guardrail defaults.
+type StorageConfig struct {
+	Provider     string `json:"provider"`       // "wasabi", "s3", "b2", "" (defaults to "wasabi" for backwards compat)
+	Endpoint     string `json:"endpoint"`       // S3-compatible endpoint URL
+	Region       string `json:"region"`         // region label for request signing
+	Bucket       string `json:"bucket"`         // bucket name
+	AccessKey    string `json:"access_key"`     // service credentials
+	SecretKey    string `json:"secret_key"`     // service credentials
+	UsePathStyle bool   `json:"use_path_style"` // path-style addressing
+}
+
+// WasabiConfig is the deprecated Wasabi-specific adapter
+// configuration. New deployments should use the Storage field with
+// Provider="wasabi" instead. Kept for backwards compatibility; the
+// config loader migrates WasabiConfig to StorageConfig automatically.
 type WasabiConfig struct {
 	Endpoint     string `json:"endpoint"`
 	Region       string `json:"region"`
@@ -54,12 +79,13 @@ type CacheConfig struct {
 
 // WorkerConfig is the drive-worker runtime configuration.
 type WorkerConfig struct {
-	Env         string       `json:"env"`
-	PostgresDSN string       `json:"postgres_dsn"`
-	Wasabi      WasabiConfig `json:"wasabi"`
-	Cache       CacheConfig  `json:"cache"`
+	Env         string        `json:"env"`
+	PostgresDSN string        `json:"postgres_dsn"`
+	Storage     StorageConfig `json:"storage"`
+	Wasabi      WasabiConfig  `json:"wasabi"` // deprecated: use Storage
+	Cache       CacheConfig   `json:"cache"`
 	// BackupCron is the cron expression for the nightly pg_dump →
-	// Wasabi backup. Default "17 3 * * *".
+	// storage backup. Default "17 3 * * *".
 	BackupCron string `json:"backup_cron"`
 	// BackupRetentionDays is the backup retention window.
 	BackupRetentionDays int `json:"backup_retention_days"`
@@ -90,13 +116,17 @@ type WorkerConfig struct {
 
 	// --- Circuit breaker (P2-10) ---
 
-	// WasabiCircuitBreakerEnabled turns on the Wasabi circuit breaker.
-	// When enabled, after consecutive failures the breaker opens and
-	// fails-fast requests until a probe succeeds. Default false.
-	WasabiCircuitBreakerEnabled bool `json:"wasabi_circuit_breaker_enabled"`
-	// WasabiCircuitBreakerThreshold is the consecutive failure count
+	// StorageCircuitBreakerEnabled turns on the storage backend circuit
+	// breaker. Default false.
+	StorageCircuitBreakerEnabled bool `json:"storage_circuit_breaker_enabled"`
+	// StorageCircuitBreakerThreshold is the consecutive failure count
 	// that opens the breaker. Default 10.
-	WasabiCircuitBreakerThreshold int `json:"wasabi_circuit_breaker_threshold"`
+	StorageCircuitBreakerThreshold int `json:"storage_circuit_breaker_threshold"`
+
+	// --- Deprecated circuit breaker fields (backwards compat) ---
+
+	WasabiCircuitBreakerEnabled   bool `json:"wasabi_circuit_breaker_enabled"`
+	WasabiCircuitBreakerThreshold int  `json:"wasabi_circuit_breaker_threshold"`
 }
 
 // LoadGateway loads the gateway config from path. If path is empty,
@@ -113,6 +143,7 @@ func LoadGateway(path string) (*GatewayConfig, error) {
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
+	cfg.migrateDeprecatedFields()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -132,6 +163,7 @@ func LoadWorker(path string) (*WorkerConfig, error) {
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
+	cfg.migrateDeprecatedFields()
 	if cfg.BackupCron == "" {
 		cfg.BackupCron = "17 3 * * *"
 	}
@@ -142,6 +174,54 @@ func LoadWorker(path string) (*WorkerConfig, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// migrateDeprecatedFields migrates the deprecated WasabiConfig and
+// WasabiCircuitBreaker* fields to the new StorageConfig and
+// StorageCircuitBreaker* fields, if the new fields are not already
+// set. This preserves backwards compatibility with existing config
+// files that use the "wasabi" block.
+func (c *GatewayConfig) migrateDeprecatedFields() {
+	migrateStorageFields(&c.Storage, &c.Wasabi,
+		&c.StorageCircuitBreakerEnabled, &c.WasabiCircuitBreakerEnabled,
+		&c.StorageCircuitBreakerThreshold, &c.WasabiCircuitBreakerThreshold)
+}
+
+// migrateDeprecatedFields is the WorkerConfig equivalent.
+func (c *WorkerConfig) migrateDeprecatedFields() {
+	migrateStorageFields(&c.Storage, &c.Wasabi,
+		&c.StorageCircuitBreakerEnabled, &c.WasabiCircuitBreakerEnabled,
+		&c.StorageCircuitBreakerThreshold, &c.WasabiCircuitBreakerThreshold)
+}
+
+// migrateStorageFields is the shared migration logic used by both
+// GatewayConfig and WorkerConfig.
+func migrateStorageFields(
+	storage *StorageConfig, wasabi *WasabiConfig,
+	storageCBEnabled, wasabiCBEnabled *bool,
+	storageCBThreshold, wasabiCBThreshold *int,
+) {
+	if storage.Provider == "" && storage.Endpoint == "" {
+		if wasabi.Endpoint != "" {
+			*storage = StorageConfig{
+				Provider:     "wasabi",
+				Endpoint:     wasabi.Endpoint,
+				Region:       wasabi.Region,
+				Bucket:       wasabi.Bucket,
+				AccessKey:    wasabi.AccessKey,
+				SecretKey:    wasabi.SecretKey,
+				UsePathStyle: wasabi.UsePathStyle,
+			}
+		}
+	} else if storage.Provider == "" {
+		storage.Provider = "wasabi"
+	}
+	if !*storageCBEnabled && *wasabiCBEnabled {
+		*storageCBEnabled = true
+	}
+	if *storageCBThreshold == 0 && *wasabiCBThreshold > 0 {
+		*storageCBThreshold = *wasabiCBThreshold
+	}
 }
 
 func (c *WorkerConfig) validate() error {
@@ -163,6 +243,9 @@ func (c *WorkerConfig) validate() error {
 	if c.PromoteParallelism < 0 {
 		return fmt.Errorf("config: promote_parallelism must be >= 0, got %d", c.PromoteParallelism)
 	}
+	if c.PromoteParallelism > 100 {
+		return fmt.Errorf("config: promote_parallelism must be <= 100, got %d", c.PromoteParallelism)
+	}
 	if c.RepairIntervalMs < 0 {
 		return fmt.Errorf("config: repair_interval_ms must be >= 0, got %d", c.RepairIntervalMs)
 	}
@@ -172,15 +255,15 @@ func (c *WorkerConfig) validate() error {
 	if c.QueueDepthAlert < 0 {
 		return fmt.Errorf("config: queue_depth_alert must be >= 0, got %d", c.QueueDepthAlert)
 	}
-	if c.WasabiCircuitBreakerThreshold < 0 {
-		return fmt.Errorf("config: wasabi_circuit_breaker_threshold must be >= 0, got %d", c.WasabiCircuitBreakerThreshold)
+	if c.StorageCircuitBreakerThreshold < 0 {
+		return fmt.Errorf("config: storage_circuit_breaker_threshold must be >= 0, got %d", c.StorageCircuitBreakerThreshold)
 	}
 	if c.Env == "production" {
 		if c.PostgresDSN == "" {
 			return errors.New("config: postgres_dsn is required in production")
 		}
-		if err := c.Wasabi.validate(); err != nil {
-			return fmt.Errorf("config: wasabi: %w", err)
+		if err := c.Storage.validate(); err != nil {
+			return fmt.Errorf("config: storage: %w", err)
 		}
 	}
 	return nil
@@ -197,15 +280,15 @@ func (c *GatewayConfig) validate() error {
 	if err := c.Cache.validate(); err != nil {
 		return fmt.Errorf("config: cache: %w", err)
 	}
-	if c.WasabiCircuitBreakerThreshold < 0 {
-		return fmt.Errorf("config: wasabi_circuit_breaker_threshold must be >= 0, got %d", c.WasabiCircuitBreakerThreshold)
+	if c.StorageCircuitBreakerThreshold < 0 {
+		return fmt.Errorf("config: storage_circuit_breaker_threshold must be >= 0, got %d", c.StorageCircuitBreakerThreshold)
 	}
 	if c.Env == "production" {
 		if c.PostgresDSN == "" {
 			return errors.New("config: postgres_dsn is required in production")
 		}
-		if err := c.Wasabi.validate(); err != nil {
-			return fmt.Errorf("config: wasabi: %w", err)
+		if err := c.Storage.validate(); err != nil {
+			return fmt.Errorf("config: storage: %w", err)
 		}
 	}
 	return nil
@@ -231,21 +314,28 @@ func (c *CacheConfig) validate() error {
 	return nil
 }
 
-func (w *WasabiConfig) validate() error {
-	if w.Endpoint == "" {
+func (s *StorageConfig) validate() error {
+	if s.Endpoint == "" {
 		return errors.New("endpoint is required")
 	}
-	if w.Region == "" {
+	if s.Region == "" {
 		return errors.New("region is required")
 	}
-	if w.Bucket == "" {
+	if s.Bucket == "" {
 		return errors.New("bucket is required")
 	}
-	if w.AccessKey == "" {
+	if s.AccessKey == "" {
 		return errors.New("access_key is required")
 	}
-	if w.SecretKey == "" {
+	if s.SecretKey == "" {
 		return errors.New("secret_key is required")
+	}
+	// Validate provider name if set.
+	switch s.Provider {
+	case "", "wasabi", "s3", "b2":
+		// ok
+	default:
+		return fmt.Errorf("unknown provider %q (want wasabi, s3, or b2)", s.Provider)
 	}
 	return nil
 }

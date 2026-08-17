@@ -469,13 +469,18 @@ func (j *GuardrailRollupJob) Stats() GuardrailStats {
 }
 
 // verifyChecksum re-reads a blob from the store and compares its
-// SHA-256 to the expected value. Used by the repair job.
+// SHA-256 to the expected value. Used by the repair job. A 5-minute
+// timeout prevents indefinite hangs on large or slow blobs.
 func verifyChecksum(ctx context.Context, store blobstore.BlobStore, key, versionID, expectedSHA string) error {
 	ref := blobstore.VersionedObjectRef{Key: key}
 	if versionID != "" {
 		ref.VersionID = versionID
 	}
-	r, _, err := store.Get(ctx, blobstore.GetRequest{
+	// Use a per-blob timeout so a single slow blob doesn't block
+	// the entire repair sweep.
+	getCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	r, _, err := store.Get(getCtx, blobstore.GetRequest{
 		Ref: ref,
 	})
 	if err != nil {

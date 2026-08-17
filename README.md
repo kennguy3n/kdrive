@@ -9,7 +9,7 @@ operations happen client-side (in the Rust/WASM SDK); the gateway only ever
 sees ciphertext, wrapped keys, and opaque metadata.
 
 This repository contains the Go implementation of the simplified
-Linode-VM + Wasabi storage subsystem described in the architecture plan
+Linode-VM + S3-compatible storage subsystem described in the architecture plan
 (see `ARCHITECTURE.md` for the full design). The companion client SDK lives
 in `kdrive-rust-sdk`.
 
@@ -44,7 +44,7 @@ in `kdrive-rust-sdk`.
 Two ways to run the gateway locally:
 
 ```bash
-# Option A: Docker (Postgres + gateway, no Wasabi credentials needed)
+# Option A: Docker (Postgres + gateway, no storage credentials needed)
 docker compose -f deploy/dev/docker-compose.yml up -d
 curl http://localhost:8080/healthz   # → "ok"
 curl http://localhost:8080/readyz    # → "ready"
@@ -58,7 +58,7 @@ In dev mode the gateway uses:
 
 - An **in-memory L1 cache**.
 - The **`local_fs_dev` BlobStore adapter** rooted at `/tmp/kchat-drive-dev`
-  (no Wasabi credentials required).
+  (no storage credentials required).
 - A **Postgres metadata store** at
   `postgres://postgres:postgres@localhost:5432/kdrive?sslmode=disable`.
 
@@ -76,9 +76,9 @@ go test ./...
 The test suite includes:
 
 - Unit tests for the `blobio` pipeline, `hotcache`, `metadata` store,
-  `wasabi` adapter (circuit breaker), and `wasabiguardrails`.
+  `s3` adapter (circuit breaker), and `storageguardrails`.
 - The shared `pkg/contracttest` BlobStore conformance suite, run against the
-  `local_fs_dev` adapter (and `wasabi` when credentials are available).
+  `local_fs_dev` adapter (and `s3` when credentials are available).
 - Worker job tests with injected fakes (`worker.NewWithDeps`).
 
 ## Binaries
@@ -97,7 +97,7 @@ replicas behind Traefik for zero-downtime deploys. Each replica:
 - Serves HTTP on `:8080`.
 - Maintains its own L1 disk cache (NVMe/SSD, 400 GiB default).
 - Connects to a shared Postgres instance.
-- Talks to Wasabi (production) or `local_fs_dev` (dev) for durable storage.
+- Talks to an S3-compatible backend (production) or `local_fs_dev` (dev) for durable storage.
 - Auto-migrates the Postgres schema on startup.
 
 **Flags:**
@@ -110,7 +110,7 @@ replicas behind Traefik for zero-downtime deploys. Each replica:
 store at `/tmp/kchat-drive-dev`, Postgres at
 `postgres://postgres:postgres@localhost:5432/kdrive?sslmode=disable`.
 
-**Production config**: JSON file with Wasabi credentials, disk cache, and
+**Production config**: JSON file with S3-compatible backend credentials, disk cache, and
 circuit-breaker settings. Rendered from a template via `envsubst` at
 container start so secrets never land in the image.
 
@@ -129,10 +129,10 @@ parallel goroutines, each on its own ticker:
 
 | Job | Purpose |
 | --- | --- |
-| `PromotionJob` | Promote `CACHED` blobs to Wasabi (`COMMITTED_DURABLE`) |
+| `PromotionJob` | Promote `CACHED` blobs to durable storage (`COMMITTED_DURABLE`) |
 | `RepairJob` | Sample durable blobs and verify their SHA-256 |
 | `PurgeJob` | Sweep orphaned multipart uploads |
-| `BackupJob` | Trigger / observe the nightly `pg_dump` → Wasabi backup |
+| `BackupJob` | Trigger / observe the nightly `pg_dump` → storage backup |
 | `GuardrailRollupJob` | Roll up cache-hit ratio + CACHED queue depth, emit alerts |
 
 **Flags:**
@@ -183,8 +183,8 @@ kdrive/
 │   ├── blobstore/
 │   │   ├── blobstore.go            # BlobStore + BlobInventory interfaces + error taxonomy
 │   │   ├── local_fs_dev/           # Dev/CI filesystem adapter
-│   │   ├── wasabi/                 # Production Wasabi adapter (AWS SDK v2, S3-compatible)
-│   │   │   ├── wasabi.go
+│   │   ├── s3/                     # Production S3-compatible adapter (Wasabi, AWS S3, B2)
+│   │   │   ├── s3.go
 │   │   │   └── circuit_breaker.go
 │   │   └── mock/                   # Mock adapter for tests
 │   ├── hotcache/
@@ -192,7 +192,7 @@ kdrive/
 │   │   ├── memory_cache.go         # In-memory cache (dev)
 │   │   ├── disk_cache.go           # Disk cache (production, NVMe/SSD)
 │   │   └── hotcache_test.go
-│   ├── wasabiguardrails/
+│   ├── storageguardrails/
 │   │   └── guardrails.go           # Fair-use egress / min-storage / hit-ratio types
 │   └── contracttest/
 │       └── contracttest.go         # Shared BlobStore conformance suite
@@ -206,7 +206,7 @@ kdrive/
 │   └── sme/
 │       ├── docker-compose.production.yml  # Production (Traefik + 2 gateways + worker + Postgres)
 │       ├── .env.example                   # Environment template
-│       ├── backup.sh                      # Nightly pg_dump + WAL → Wasabi
+│       ├── backup.sh                      # Nightly pg_dump + WAL → storage backend
 │       ├── upgrade.sh                     # Zero-downtime rolling upgrade
 │       ├── gateway/gateway.json.tmpl      # Gateway config template
 │       ├── worker/worker.json.tmpl        # Worker config template
@@ -233,7 +233,8 @@ kdrive/
   "env": "production",
   "http_addr": ":8080",
   "postgres_dsn": "postgres://user:pass@host:5432/kdrive?sslmode=require",
-  "wasabi": {
+  "storage": {
+    "provider": "wasabi",
     "endpoint": "s3.ap-southeast-1.wasabisys.com",
     "region": "ap-southeast-1",
     "bucket": "kchat-drive-prod",
@@ -246,10 +247,15 @@ kdrive/
     "disk_root_path": "/var/lib/kdrive/cache",
     "max_bytes": 429496729600
   },
-  "wasabi_circuit_breaker_enabled": false,
-  "wasabi_circuit_breaker_threshold": 10
+  "storage_circuit_breaker_enabled": false,
+  "storage_circuit_breaker_threshold": 10
 }
 ```
+
+To use AWS S3 instead, set `"provider": "s3"` and use AWS endpoints.
+For Backblaze B2, set `"provider": "b2"` and use the B2 S3-compatible
+endpoint. The old `"wasabi"` config block is still accepted for
+backwards compatibility.
 
 ### Worker Config (JSON)
 
@@ -257,7 +263,7 @@ kdrive/
 {
   "env": "production",
   "postgres_dsn": "postgres://user:pass@host:5432/kdrive?sslmode=require",
-  "wasabi": { "..." },
+  "storage": { "..." },
   "cache": { "type": "disk", "disk_root_path": "/var/lib/kdrive/cache", "max_bytes": 429496729600 },
   "backup_cron": "17 3 * * *",
   "backup_retention_days": 14,
@@ -267,8 +273,8 @@ kdrive/
   "repair_interval_ms": 300000,
   "repair_sample_count": 10,
   "queue_depth_alert": 1000,
-  "wasabi_circuit_breaker_enabled": false,
-  "wasabi_circuit_breaker_threshold": 10
+  "storage_circuit_breaker_enabled": false,
+  "storage_circuit_breaker_threshold": 10
 }
 ```
 
@@ -284,11 +290,13 @@ field below is sourced from the `.env` file at container start.
 | `POSTGRES_USER` | `postgres` | Postgres user |
 | `POSTGRES_PASSWORD` | required | Postgres password |
 | `POSTGRES_DB` | `kdrive` | Postgres database name |
-| `WASABI_ENDPOINT` | required | Wasabi S3 endpoint |
-| `WASABI_REGION` | required | Wasabi region |
-| `WASABI_BUCKET` | required | Wasabi bucket name |
-| `WASABI_ACCESS_KEY` | required | Wasabi access key |
-| `WASABI_SECRET_KEY` | required | Wasabi secret key |
+| `STORAGE_PROVIDER` | `wasabi` | Storage backend: `wasabi`, `s3`, or `b2` |
+| `STORAGE_ENDPOINT` | required | S3-compatible endpoint URL |
+| `STORAGE_REGION` | required | Region for request signing |
+| `STORAGE_BUCKET` | required | Bucket name |
+| `STORAGE_ACCESS_KEY` | required | Access key |
+| `STORAGE_SECRET_KEY` | required | Secret key |
+| `WASABI_*` | — | Deprecated: old var names, migrated to `STORAGE_*` automatically |
 | `KDRIVE_CACHE_MAX_BYTES` | `429496729600` (400 GiB) | L1 disk cache capacity per replica |
 | `KDRIVE_BACKUP_CRON` | `17 3 * * *` | Nightly backup cron expression |
 | `KDRIVE_BACKUP_RETENTION_DAYS` | `14` | Backup retention window |
@@ -298,12 +306,12 @@ field below is sourced from the `.env` file at container start.
 | `KDRIVE_REPAIR_INTERVAL_MS` | `300000` | Repair scan interval |
 | `KDRIVE_REPAIR_SAMPLE_COUNT` | `10` | Durable blobs to sample per repair scan |
 | `KDRIVE_QUEUE_DEPTH_ALERT` | `1000` | CACHED blob count alert threshold |
-| `KDRIVE_CIRCUIT_BREAKER_ENABLED` | `false` | Enable Wasabi circuit breaker |
+| `KDRIVE_CIRCUIT_BREAKER_ENABLED` | `false` | Enable storage circuit breaker |
 | `KDRIVE_CIRCUIT_BREAKER_THRESHOLD` | `10` | Consecutive failures before breaker opens |
 
 The config loader validates all tuning knobs at startup and fails fast on
 negative values or missing production-required fields (`postgres_dsn`,
-Wasabi endpoint/region/bucket/credentials).
+Storage endpoint/region/bucket/credentials).
 
 ## API Endpoints
 
@@ -312,7 +320,7 @@ Wasabi endpoint/region/bucket/credentials).
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/healthz` | Liveness probe (always `200 "ok"`) |
-| `GET` | `/readyz` | Readiness probe (checks Postgres `Ping` + a Wasabi `Head` probe) |
+| `GET` | `/readyz` | Readiness probe (checks Postgres `Ping` + a storage `Head` probe) |
 | `GET` | `/metrics` | Prometheus-format metrics (see [Observability](#observability)) |
 
 ### Drive API Endpoints (`/v1/`)
@@ -385,7 +393,7 @@ compose file mounts the NVMe cache volume owned by this UID.
 
 ```bash
 cd deploy/sme
-cp .env.example .env  # fill in Wasabi + Postgres credentials + KDRIVE_HOST
+cp .env.example .env  # fill in storage + Postgres credentials + KDRIVE_HOST
 docker compose -f docker-compose.production.yml up -d
 ```
 
@@ -402,7 +410,7 @@ Add to host cron (or run manually):
 
 `backup.sh` runs `pg_dump` inside the postgres container, compresses with
 `gzip -9`, uploads to `s3://$WASABI_BUCKET/backups/postgres/`, syncs the
-WAL archive volume to Wasabi (for PITR), and prunes backups older than the
+WAL archive volume to the storage backend (for PITR), and prunes backups older than the
 retention window.
 
 ### Zero-Downtime Upgrade
@@ -455,7 +463,7 @@ default. Key log streams:
 
 ### Readiness
 
-`/readyz` checks Postgres (`Ping`) and the durable store. For Wasabi it
+`/readyz` checks Postgres (`Ping`) and the durable store. For S3-compatible backends it
 issues a `Head` on a known non-existent probe key — `nil` error or
 `ErrNotFound` both mean the store is reachable; any other error (network,
 auth, timeout) means not ready. The probe has a 5-second deadline.
@@ -474,9 +482,9 @@ Notable test packages:
   `blob_placements` upsert / `MarkDurable`.
 - `internal/worker` — job loops with injected fakes via `NewWithDeps`.
 - `pkg/hotcache` — memory + disk cache, LRU eviction, hot-pin policy.
-- `pkg/blobstore/wasabi` — circuit breaker open/half-open/closed
+- `pkg/blobstore/s3` — circuit breaker open/half-open/closed
   transitions.
-- `pkg/wasabiguardrails` — budget cap math, residual billable window.
+- `pkg/storageguardrails` — budget cap math, residual billable window.
 - `pkg/contracttest` — the shared BlobStore conformance suite (conditional
   create, ambiguous-PUT-timeout HEAD+verify, byte-range GET, multipart
   create/upload/complete/abort, copy-within-provider, retention
@@ -486,13 +494,13 @@ Notable test packages:
 
 ## Architecture Defaults (Plan §10)
 
-- **No WORM / Object Lock in phase 1** — Wasabi bucket versioning only.
+- **No WORM / Object Lock in phase 1** — bucket versioning only.
 - **Single Postgres instance** (no HA) is acceptable for v1; WAL archiving
   + nightly `pg_dump` provide PITR with ~15 min RPO.
 - **Erasure ledger** is the one DR safety net kept from v1 (ADR-021).
 - **L1 disk cache on NVMe** — 400 GiB per replica default, LRU with hot-pin.
 - **Circuit breaker optional** — off by default; opens after N consecutive
-  Wasabi failures and probes after 30 seconds.
+  storage backend failures and probes after 30 seconds.
 - **Object keys are opaque** — they carry no tenant, user, group, file, or
   folder identifiers (§3 invariant 14).
 - **KChat SHA-256 is authoritative** — provider ETags are never used as

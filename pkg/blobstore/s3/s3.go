@@ -1,27 +1,29 @@
-// Package wasabi implements the BlobStore and BlobInventory
-// interfaces against Wasabi's S3-compatible API.
+// Package s3 implements the BlobStore and BlobInventory interfaces
+// against any S3-compatible API (Wasabi, AWS S3, Backblaze B2).
 //
-// Wasabi is the only production durable origin in the simplified
-// KChat Drive storage architecture. The adapter is built directly on
-// the AWS SDK v2 (the s3_generic shared-base pattern from
-// zk-object-fabric is folded in here since there is only one
-// S3-shaped provider in phase 1).
+// The adapter is built directly on the AWS SDK v2 S3 client, which
+// works with any S3-compatible endpoint. Provider-specific behavior
+// (capabilities, error prefixes, write-result hash namespace,
+// guardrail defaults) is selected via the ProviderName field on
+// Config.
 //
-// Wasabi specifics honoured here:
-//   - 90-day minimum storage duration (WasabiMinStorageDays). Short-
-//     TTL objects must never reach Wasabi; the gateway routes them
-//     to the local cache only.
-//   - Fair-use egress <= 1x active stored bytes per billing cycle.
-//     Enforcement lives in pkg/wasabiguardrails; this adapter only
-//     reports the cost model and capability envelope.
-//   - Bucket versioning is enabled so PurgeAllVersions and
-//     DeleteVersion behave correctly.
-//   - Object Lock is supported via capability flags when the bucket
-//     is configured with a lock policy.
-package wasabi
+// Supported providers:
+//   - "wasabi": 90-day minimum storage duration, fair-use egress
+//     <= 1x active stored bytes, Object Lock supported. Guardrail
+//     defaults live in pkg/storageguardrails.
+//   - "s3": AWS S3. Object Lock supported. No minimum storage
+//     duration. Standard AWS pricing.
+//   - "b2": Backblaze B2 via its S3-compatible API. No S3 Object
+//     Lock (B2 uses its own file-lock mechanism). No minimum storage
+//     duration. B2 fair-use egress is more generous than Wasabi.
+//
+// Bucket versioning should be enabled so PurgeAllVersions and
+// DeleteVersion behave correctly. Object Lock is supported via
+// capability flags when the bucket is configured with a lock policy
+// (Wasabi and AWS S3 only).
+package s3
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -31,6 +33,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +52,8 @@ import (
 // WasabiMinStorageDays is Wasabi's 90-day minimum storage duration.
 // Objects deleted before this window still incur 90 days of billable
 // storage. The data plane must not write short-TTL objects to Wasabi.
+// Kept for backwards compatibility; new code should use
+// storageguardrails.ProfileFor(providerName).MinStorageDays.
 const WasabiMinStorageDays = 90
 
 // WasabiStorageUSDPerTBMonth is Wasabi's headline storage price per
@@ -58,21 +63,29 @@ const WasabiStorageUSDPerTBMonth = 6.99
 
 const minStorageDuration = WasabiMinStorageDays * 24 * time.Hour
 
-// Config is the Wasabi runtime configuration.
+// Config is the S3-compatible provider runtime configuration.
 type Config struct {
-	// Endpoint is the Wasabi S3 endpoint URL, e.g.
-	// "https://s3.ap-southeast-1.wasabisys.com".
+	// ProviderName selects the provider profile. Known values:
+	// "wasabi", "s3", "b2". Defaults to "s3" when empty. The
+	// provider name is used in error messages, write-result hashes,
+	// and capability reporting.
+	ProviderName string
+	// Endpoint is the S3-compatible endpoint URL, e.g.
+	// "https://s3.ap-southeast-1.wasabisys.com" (Wasabi),
+	// "https://s3.us-west-004.backblazeb2.com" (B2), or "" for
+	// AWS S3 default regional endpoint.
 	Endpoint string
-	// Region is the Wasabi region label used when signing requests.
+	// Region is the region label used when signing requests.
 	Region string
-	// Bucket is the Wasabi bucket used by this adapter instance.
+	// Bucket is the bucket used by this adapter instance.
 	Bucket string
-	// AccessKey / SecretKey are the Wasabi service credentials. They
-	// are never logged.
+	// AccessKey / SecretKey are the service credentials. They are
+	// never logged.
 	AccessKey string
 	SecretKey string
-	// UsePathStyle forces path-style addressing. Wasabi supports both;
-	// path-style is the safer default for S3-compatible endpoints.
+	// UsePathStyle forces path-style addressing. Most S3-compatible
+	// endpoints (Wasabi, B2, MinIO) require or prefer path-style;
+	// AWS S3 supports both.
 	UsePathStyle bool
 }
 
@@ -100,11 +113,18 @@ type S3API interface {
 	PutObjectLegalHold(ctx context.Context, in *s3.PutObjectLegalHoldInput, opts ...func(*s3.Options)) (*s3.PutObjectLegalHoldOutput, error)
 }
 
-// Provider is the Wasabi BlobStore implementation.
+// Provider is the S3-compatible BlobStore implementation.
 type Provider struct {
-	cfg     Config
-	client  S3API
-	breaker *CircuitBreaker // nil = no circuit breaker
+	cfg          Config
+	client       S3API
+	breaker      *CircuitBreaker // nil = no circuit breaker
+	errPrefixVal string          // cached provider-specific error prefix
+}
+
+// errPrefix returns the provider-specific error message prefix, e.g.
+// "wasabi: " or "s3: " or "b2: ".
+func (p *Provider) errPrefix() string {
+	return p.errPrefixVal
 }
 
 // New returns a Provider backed by a freshly constructed s3.Client
@@ -112,8 +132,8 @@ type Provider struct {
 //
 // HTTP transport tuning:
 //   - MaxIdleConnsPerHost: 100 (default is 2, which bottlenecks
-//     concurrent requests to one Wasabi endpoint).
-//   - IdleConnTimeout: 90s (wasabi keep-alive window).
+//     concurrent requests to one endpoint).
+//   - IdleConnTimeout: 90s (keep-alive window).
 //   - TLS handshake timeout: 5s for cross-region latency.
 //   - Response header timeout: 30s to detect stalled connections.
 //
@@ -122,6 +142,9 @@ type Provider struct {
 //   - No retry for 4xx (client errors are not transient).
 //   - Max retry backoff: 20s.
 func New(cfg Config) (*Provider, error) {
+	if cfg.ProviderName == "" {
+		cfg.ProviderName = "s3"
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -164,13 +187,13 @@ func New(cfg Config) (*Provider, error) {
 			}
 		})
 	})
-	return &Provider{cfg: cfg, client: client}, nil
+	return &Provider{cfg: cfg, client: client, errPrefixVal: cfg.ProviderName + ": "}, nil
 }
 
 // NewWithCircuitBreaker returns a Provider with a circuit breaker
-// that fail-fasts requests when Wasabi is consistently returning
-// errors. The breaker opens after threshold consecutive failures and
-// stays open for resetTimeout before allowing a probe.
+// that fail-fasts requests when the storage backend is consistently
+// returning errors. The breaker opens after threshold consecutive
+// failures and stays open for resetTimeout before allowing a probe.
 func NewWithCircuitBreaker(cfg Config, threshold int, resetTimeout time.Duration) (*Provider, error) {
 	p, err := New(cfg)
 	if err != nil {
@@ -203,27 +226,34 @@ func isRetryableHTTPError(err error) bool {
 // NewWithClient returns a Provider using a caller-supplied S3API.
 // Tests use this to exercise the adapter against an in-memory fake.
 func NewWithClient(cfg Config, client S3API) (*Provider, error) {
+	if cfg.ProviderName == "" {
+		cfg.ProviderName = "s3"
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	if client == nil {
-		return nil, errors.New("wasabi: client is required")
+		return nil, errors.New("s3: client is required")
 	}
-	return &Provider{cfg: cfg, client: client}, nil
+	return &Provider{cfg: cfg, client: client, errPrefixVal: cfg.ProviderName + ": "}, nil
 }
 
 func (c Config) validate() error {
+	prefix := c.ProviderName + ": "
+	if c.ProviderName == "" {
+		prefix = "s3: "
+	}
 	if c.Endpoint == "" {
-		return errors.New("wasabi: endpoint is required")
+		return errors.New(prefix + "endpoint is required")
 	}
 	if c.Region == "" {
-		return errors.New("wasabi: region is required")
+		return errors.New(prefix + "region is required")
 	}
 	if c.Bucket == "" {
-		return errors.New("wasabi: bucket is required")
+		return errors.New(prefix + "bucket is required")
 	}
 	if c.AccessKey == "" || c.SecretKey == "" {
-		return errors.New("wasabi: access_key and secret_key are required")
+		return errors.New(prefix + "access_key and secret_key are required")
 	}
 	return nil
 }
@@ -247,10 +277,10 @@ func (p *Provider) RegionName() string { return p.cfg.Region }
 // on the caller side, never by ETag.
 func (p *Provider) Put(ctx context.Context, req blobstore.PutRequest) (blobstore.PutResult, error) {
 	if req.Key == "" {
-		return blobstore.PutResult{}, errors.New("wasabi: key is required")
+		return blobstore.PutResult{}, errors.New(p.errPrefix() + "key is required")
 	}
 	if req.Body == nil {
-		return blobstore.PutResult{}, errors.New("wasabi: body is required")
+		return blobstore.PutResult{}, errors.New(p.errPrefix() + "body is required")
 	}
 	if p.breaker != nil {
 		if err := p.breaker.Allow(); err != nil {
@@ -273,6 +303,14 @@ func (p *Provider) Put(ctx context.Context, req blobstore.PutRequest) (blobstore
 	}
 	if req.IfNoneMatch {
 		in.IfNoneMatch = aws.String("*")
+	}
+	// Reject retention requests for providers that don't support
+	// S3 Object Lock (e.g., Backblaze B2).
+	if req.Retention.Mode != blobstore.RetentionNone || req.Retention.LegalHold {
+		caps := p.Capabilities(ctx)
+		if !caps.S3ObjectLock {
+			return blobstore.PutResult{}, errors.New(p.errPrefix() + "object lock not supported by this provider")
+		}
 	}
 	if req.Retention.Mode != blobstore.RetentionNone {
 		applyRetentionToPut(in, req.Retention)
@@ -314,14 +352,14 @@ func (p *Provider) Put(ctx context.Context, req blobstore.PutRequest) (blobstore
 		Size:            size,
 		ChecksumSHA256:  sum,
 		WriteTime:       now,
-		WriteResultHash: computeWriteResultHash(p.cfg.Bucket, req.Key, versionID, blobstore.VersioningEnabled, size, sum),
+		WriteResultHash: computeWriteResultHash(p.cfg.ProviderName, p.cfg.Bucket, req.Key, versionID, blobstore.VersioningEnabled, size, sum),
 	}, nil
 }
 
 // Head returns metadata for the current version of key.
 func (p *Provider) Head(ctx context.Context, ref blobstore.ObjectRef) (blobstore.ObjectMeta, error) {
 	if ref.Key == "" {
-		return blobstore.ObjectMeta{}, errors.New("wasabi: key is required")
+		return blobstore.ObjectMeta{}, errors.New(p.errPrefix() + "key is required")
 	}
 	if p.breaker != nil {
 		if err := p.breaker.Allow(); err != nil {
@@ -348,7 +386,7 @@ func (p *Provider) Head(ctx context.Context, ref blobstore.ObjectRef) (blobstore
 // Get fetches an object, honouring req.Range when set.
 func (p *Provider) Get(ctx context.Context, req blobstore.GetRequest) (io.ReadCloser, blobstore.ObjectMeta, error) {
 	if req.Ref.Key == "" {
-		return nil, blobstore.ObjectMeta{}, errors.New("wasabi: key is required")
+		return nil, blobstore.ObjectMeta{}, errors.New(p.errPrefix() + "key is required")
 	}
 	if p.breaker != nil {
 		if err := p.breaker.Allow(); err != nil {
@@ -390,7 +428,7 @@ func (p *Provider) Get(ctx context.Context, req blobstore.GetRequest) (io.ReadCl
 // Delete places a delete marker (versioning is enabled).
 func (p *Provider) Delete(ctx context.Context, ref blobstore.ObjectRef) error {
 	if ref.Key == "" {
-		return errors.New("wasabi: key is required")
+		return errors.New(p.errPrefix() + "key is required")
 	}
 	if p.breaker != nil {
 		if err := p.breaker.Allow(); err != nil {
@@ -418,7 +456,7 @@ func (p *Provider) Delete(ctx context.Context, ref blobstore.ObjectRef) error {
 // deletes them individually. This is the erasure path.
 func (p *Provider) PurgeAllVersions(ctx context.Context, ref blobstore.ObjectRef) error {
 	if ref.Key == "" {
-		return errors.New("wasabi: key is required")
+		return errors.New(p.errPrefix() + "key is required")
 	}
 	var cursor *string
 	for {
@@ -482,7 +520,7 @@ func (p *Provider) PurgeAllVersions(ctx context.Context, ref blobstore.ObjectRef
 // CreateMultipart initiates a multipart upload.
 func (p *Provider) CreateMultipart(ctx context.Context, req blobstore.MultipartRequest) (blobstore.MultipartUpload, error) {
 	if req.Key == "" {
-		return blobstore.MultipartUpload{}, errors.New("wasabi: key is required")
+		return blobstore.MultipartUpload{}, errors.New(p.errPrefix() + "key is required")
 	}
 	if p.breaker != nil {
 		if err := p.breaker.Allow(); err != nil {
@@ -498,6 +536,14 @@ func (p *Provider) CreateMultipart(ctx context.Context, req blobstore.MultipartR
 	}
 	if req.ChecksumSHA256 != "" {
 		in.ChecksumAlgorithm = s3types.ChecksumAlgorithm("SHA256")
+	}
+	// Reject retention requests for providers that don't support
+	// S3 Object Lock (e.g., Backblaze B2).
+	if req.Retention.Mode != blobstore.RetentionNone || req.Retention.LegalHold {
+		caps := p.Capabilities(ctx)
+		if !caps.S3ObjectLock {
+			return blobstore.MultipartUpload{}, errors.New(p.errPrefix() + "object lock not supported by this provider")
+		}
 	}
 	if req.Retention.Mode != blobstore.RetentionNone {
 		applyRetentionToCreateMultipart(in, req.Retention)
@@ -524,14 +570,14 @@ func (p *Provider) CreateMultipart(ctx context.Context, req blobstore.MultipartR
 // provider presigns, so this returns an error indicating the mode is
 // disabled.
 func (p *Provider) SignUploadPart(ctx context.Context, req blobstore.SignPartRequest) (blobstore.SignedRequest, error) {
-	return blobstore.SignedRequest{}, errors.New("wasabi: direct provider presign is disabled in phase 1 (ADR-019); use the blob-edge capability path")
+	return blobstore.SignedRequest{}, errors.New(p.errPrefix() + "direct provider presign is disabled in phase 1 (ADR-019); use the blob-edge capability path")
 }
 
 // CompleteMultipart finalizes a multipart upload. Parts are uploaded
 // out-of-band by the gateway's edge path; this call assembles them.
 func (p *Provider) CompleteMultipart(ctx context.Context, req blobstore.CompleteRequest) (blobstore.PutResult, error) {
 	if req.Upload.Key == "" || req.Upload.UploadID == "" {
-		return blobstore.PutResult{}, errors.New("wasabi: upload key and id are required")
+		return blobstore.PutResult{}, errors.New(p.errPrefix() + "upload key and id are required")
 	}
 	if p.breaker != nil {
 		if err := p.breaker.Allow(); err != nil {
@@ -588,14 +634,14 @@ func (p *Provider) CompleteMultipart(ctx context.Context, req blobstore.Complete
 		Size:            size,
 		ChecksumSHA256:  checksum,
 		WriteTime:       writeTime,
-		WriteResultHash: computeWriteResultHash(p.cfg.Bucket, req.Upload.Key, versionID, blobstore.VersioningEnabled, size, checksum),
+		WriteResultHash: computeWriteResultHash(p.cfg.ProviderName, p.cfg.Bucket, req.Upload.Key, versionID, blobstore.VersioningEnabled, size, checksum),
 	}, nil
 }
 
 // AbortMultipart aborts an in-progress multipart upload.
 func (p *Provider) AbortMultipart(ctx context.Context, upload blobstore.MultipartUpload) error {
 	if upload.Key == "" || upload.UploadID == "" {
-		return errors.New("wasabi: upload key and id are required")
+		return errors.New(p.errPrefix() + "upload key and id are required")
 	}
 	_, err := p.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(p.cfg.Bucket),
@@ -609,18 +655,20 @@ func (p *Provider) AbortMultipart(ctx context.Context, upload blobstore.Multipar
 }
 
 // UploadPart uploads one part of a multipart upload directly from
-// the server. The body is read and uploaded to Wasabi as an S3
-// UploadPart call. The returned UploadedPart carries the part number,
-// size, and SHA-256 checksum for the CompleteMultipart call.
+// the server. The body is streamed to a temp file while computing
+// the SHA-256 checksum via TeeReader, then streamed to S3. This
+// avoids buffering the entire part in memory. The returned
+// UploadedPart carries the part number, size, and SHA-256 checksum
+// for the CompleteMultipart call.
 func (p *Provider) UploadPart(ctx context.Context, req blobstore.UploadPartRequest) (blobstore.UploadedPart, error) {
 	if req.Upload.Key == "" || req.Upload.UploadID == "" {
-		return blobstore.UploadedPart{}, errors.New("wasabi: upload key and id are required")
+		return blobstore.UploadedPart{}, errors.New(p.errPrefix() + "upload key and id are required")
 	}
 	if req.PartNumber < 1 || req.PartNumber > 10000 {
-		return blobstore.UploadedPart{}, errors.New("wasabi: part number must be 1-10000")
+		return blobstore.UploadedPart{}, errors.New(p.errPrefix() + "part number must be 1-10000")
 	}
 	if req.Body == nil {
-		return blobstore.UploadedPart{}, errors.New("wasabi: part body is required")
+		return blobstore.UploadedPart{}, errors.New(p.errPrefix() + "part body is required")
 	}
 	if p.breaker != nil {
 		if err := p.breaker.Allow(); err != nil {
@@ -628,25 +676,45 @@ func (p *Provider) UploadPart(ctx context.Context, req blobstore.UploadPartReque
 		}
 	}
 
-	// Read the part body to compute size and checksum. We need the
-	// full part in memory for the SDK call (UploadPartInput takes a
-	// reader, but we also need the length and hash).
-	partBody, err := io.ReadAll(req.Body)
+	// Stream the part body to a temp file while computing the SHA-256
+	// checksum via TeeReader. This avoids buffering the entire part
+	// (up to 5 GiB) in memory. The temp file is seekable so the SDK
+	// can determine ContentLength without buffering.
+	// Cap at MaxPartSize (5 GiB) to prevent unbounded disk usage.
+	const maxPartBytes = 5 * 1024 * 1024 * 1024
+	tmpFile, err := os.CreateTemp("", "s3-uploadpart-*")
 	if err != nil {
-		return blobstore.UploadedPart{}, fmt.Errorf("wasabi: read part %d: %w", req.PartNumber, err)
+		return blobstore.UploadedPart{}, fmt.Errorf(p.errPrefix()+"create temp file for part %d: %w", req.PartNumber, err)
 	}
-	sum := sha256.Sum256(partBody)
-	checksum := hex.EncodeToString(sum[:])
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	defer tmpFile.Close()
+
+	hasher := sha256.New()
+	tee := io.TeeReader(io.LimitReader(req.Body, maxPartBytes+1), hasher)
+	n, err := io.Copy(tmpFile, tee)
+	if err != nil {
+		return blobstore.UploadedPart{}, fmt.Errorf(p.errPrefix()+"read part %d: %w", req.PartNumber, err)
+	}
+	if n > maxPartBytes {
+		return blobstore.UploadedPart{}, errors.New(p.errPrefix() + "part size exceeds 5 GiB limit")
+	}
+	checksum := hex.EncodeToString(hasher.Sum(nil))
+
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return blobstore.UploadedPart{}, fmt.Errorf(p.errPrefix()+"seek temp file for part %d: %w", req.PartNumber, err)
+	}
 
 	out, err := p.client.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:         aws.String(p.cfg.Bucket),
 		Key:            aws.String(req.Upload.Key),
 		UploadId:       aws.String(req.Upload.UploadID),
 		PartNumber:     aws.Int32(req.PartNumber),
-		Body:           bytes.NewReader(partBody),
-		ContentLength:  aws.Int64(int64(len(partBody))),
+		Body:           tmpFile,
+		ContentLength:  aws.Int64(n),
 		ChecksumSHA256: aws.String(checksum),
 	})
+	_ = out // ETag not used; KChat SHA-256 is authoritative
 	if err != nil {
 		classified := p.classifyError(err, req.Upload.Key)
 		if p.breaker != nil && !isClientError(classified) {
@@ -658,12 +726,11 @@ func (p *Provider) UploadPart(ctx context.Context, req blobstore.UploadPartReque
 		p.breaker.RecordSuccess()
 	}
 
-	// Use the SDK-returned ETag or our computed checksum.
-	_ = out
+	// KChat SHA-256 is the authoritative checksum; ETag is not used.
 	return blobstore.UploadedPart{
 		PartNumber:     req.PartNumber,
 		ChecksumSHA256: checksum,
-		Size:           int64(len(partBody)),
+		Size:           n,
 	}, nil
 }
 
@@ -671,7 +738,7 @@ func (p *Provider) UploadPart(ctx context.Context, req blobstore.UploadPartReque
 // same Wasabi bucket.
 func (p *Provider) CopyWithinProvider(ctx context.Context, req blobstore.CopyWithinProviderRequest) (blobstore.PutResult, error) {
 	if req.Src.Key == "" || req.DstKey == "" {
-		return blobstore.PutResult{}, errors.New("wasabi: src and dst keys are required")
+		return blobstore.PutResult{}, errors.New(p.errPrefix() + "src and dst keys are required")
 	}
 	src := p.cfg.Bucket + "/" + req.Src.Key
 	if req.Src.VersionID != "" {
@@ -693,11 +760,9 @@ func (p *Provider) CopyWithinProvider(ctx context.Context, req blobstore.CopyWit
 		return blobstore.PutResult{}, p.classifyError(err, req.DstKey)
 	}
 	versionID := aws.ToString(out.VersionId)
-	if versionID == "" && out.CopyObjectResult != nil {
-		// Some S3-compatible endpoints surface the version via the
-		// top-level VersionId field; fall back to the result struct.
-		_ = out.CopyObjectResult
-	}
+	// CopyObjectResult does not carry a VersionId; the top-level
+	// VersionId field is the only source. The HEAD below will
+	// populate it if the endpoint didn't return it on CopyObject.
 	// CopyObject does not return content length; query it.
 	head, herr := p.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(p.cfg.Bucket),
@@ -719,14 +784,14 @@ func (p *Provider) CopyWithinProvider(ctx context.Context, req blobstore.CopyWit
 		Size:            size,
 		ChecksumSHA256:  sum,
 		WriteTime:       time.Now().UTC(),
-		WriteResultHash: computeWriteResultHash(p.cfg.Bucket, req.DstKey, versionID, blobstore.VersioningEnabled, size, sum),
+		WriteResultHash: computeWriteResultHash(p.cfg.ProviderName, p.cfg.Bucket, req.DstKey, versionID, blobstore.VersioningEnabled, size, sum),
 	}, nil
 }
 
 // GetRetention returns the retention state of a specific version.
 func (p *Provider) GetRetention(ctx context.Context, ref blobstore.VersionedObjectRef) (blobstore.RetentionState, error) {
 	if ref.Key == "" {
-		return blobstore.RetentionState{}, errors.New("wasabi: key is required")
+		return blobstore.RetentionState{}, errors.New(p.errPrefix() + "key is required")
 	}
 	out, err := p.client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
 		Bucket:    aws.String(p.cfg.Bucket),
@@ -756,7 +821,7 @@ func (p *Provider) GetRetention(ctx context.Context, ref blobstore.VersionedObje
 // authorized clear. It never silently shortens a retention period.
 func (p *Provider) UpdateRetention(ctx context.Context, req blobstore.RetentionUpdate) (blobstore.RetentionState, error) {
 	if req.Ref.Key == "" {
-		return blobstore.RetentionState{}, errors.New("wasabi: key is required")
+		return blobstore.RetentionState{}, errors.New(p.errPrefix() + "key is required")
 	}
 	in := &s3.PutObjectRetentionInput{
 		Bucket:    aws.String(p.cfg.Bucket),
@@ -784,7 +849,7 @@ func (p *Provider) UpdateRetention(ctx context.Context, req blobstore.RetentionU
 // SetLegalHold toggles the legal-hold flag on a version.
 func (p *Provider) SetLegalHold(ctx context.Context, ref blobstore.VersionedObjectRef, enabled bool) (blobstore.RetentionState, error) {
 	if ref.Key == "" {
-		return blobstore.RetentionState{}, errors.New("wasabi: key is required")
+		return blobstore.RetentionState{}, errors.New(p.errPrefix() + "key is required")
 	}
 	status := s3types.ObjectLockLegalHoldStatus("OFF")
 	if enabled {
@@ -803,26 +868,49 @@ func (p *Provider) SetLegalHold(ctx context.Context, ref blobstore.VersionedObje
 
 // Capabilities reports the Wasabi envelope.
 func (p *Provider) Capabilities(ctx context.Context) blobstore.ProviderCapabilities {
-	return blobstore.ProviderCapabilities{
-		ProviderVersioning:        true,
-		DeleteAllVersions:         true,
-		ConditionalPut:            true,
-		NativeSHA256Checksum:      true,
-		S3ObjectLock:              true,
-		PerVersionRetentionGet:    true,
-		PerVersionRetentionExtend: true,
-		PerVersionRetentionClear:  true,
-		LegalHoldSetClear:         true,
-		GovernanceBypassDenied:    true,
-		ListAndAbortMultipart:     true,
-		BucketVersioningState:     blobstore.VersioningEnabled,
-		MaxObjectSize:             5 * 1024 * 1024 * 1024 * 1024,
-		MaxPartSize:               5 * 1024 * 1024 * 1024,
-		MaxParts:                  10000,
-		MinPartBytes:              5 * 1024 * 1024,
-		ChecksumOnComplete:        true,
-		ExactJurisdiction:         p.cfg.Region,
+	return defaultCapabilities(p.cfg.ProviderName, p.cfg.Region)
+}
+
+// defaultCapabilities returns the capability envelope for a given
+// provider. Wasabi and AWS S3 support S3 Object Lock; Backblaze B2's
+// S3-compatible API does not support Object Lock the same way (B2
+// uses its own file-lock mechanism).
+func defaultCapabilities(providerName, region string) blobstore.ProviderCapabilities {
+	caps := blobstore.ProviderCapabilities{
+		ProviderVersioning:    true,
+		DeleteAllVersions:     true,
+		ConditionalPut:        true,
+		NativeSHA256Checksum:  true,
+		ListAndAbortMultipart: true,
+		BucketVersioningState: blobstore.VersioningEnabled,
+		MaxObjectSize:         5 * 1024 * 1024 * 1024 * 1024,
+		MaxPartSize:           5 * 1024 * 1024 * 1024,
+		MaxParts:              10000,
+		MinPartBytes:          5 * 1024 * 1024,
+		ChecksumOnComplete:    true,
+		ExactJurisdiction:     region,
 	}
+	switch providerName {
+	case "wasabi", "s3":
+		// Wasabi and AWS S3 support S3 Object Lock.
+		caps.S3ObjectLock = true
+		caps.PerVersionRetentionGet = true
+		caps.PerVersionRetentionExtend = true
+		caps.PerVersionRetentionClear = true
+		caps.LegalHoldSetClear = true
+		caps.GovernanceBypassDenied = true
+	case "b2":
+		// B2's S3-compatible API does not support S3 Object Lock.
+		// B2 has its own file-lock mechanism accessed via the native
+		// B2 API, which is not used in this adapter.
+		caps.S3ObjectLock = false
+		caps.PerVersionRetentionGet = false
+		caps.PerVersionRetentionExtend = false
+		caps.PerVersionRetentionClear = false
+		caps.LegalHoldSetClear = false
+		caps.GovernanceBypassDenied = false
+	}
+	return caps
 }
 
 // --- BlobInventory ---
@@ -838,9 +926,12 @@ func (p *Provider) ListObjects(ctx context.Context, req blobstore.ListObjectsReq
 	if req.Cursor != "" {
 		in.ContinuationToken = aws.String(req.Cursor)
 	}
-	if req.MaxKeys > 0 {
-		in.MaxKeys = aws.Int32(req.MaxKeys)
+	// Cap MaxKeys at 1000 (S3 API maximum per page).
+	maxKeys := req.MaxKeys
+	if maxKeys <= 0 || maxKeys > 1000 {
+		maxKeys = 1000
 	}
+	in.MaxKeys = aws.Int32(maxKeys)
 	out, err := p.client.ListObjectsV2(ctx, in)
 	if err != nil {
 		return blobstore.ObjectPage{}, p.classifyError(err, "")
@@ -864,7 +955,7 @@ func (p *Provider) ListObjects(ctx context.Context, req blobstore.ListObjectsReq
 // ListObjectVersions paginates versions of one object.
 func (p *Provider) ListObjectVersions(ctx context.Context, req blobstore.ListVersionsRequest) (blobstore.VersionPage, error) {
 	if req.Key == "" {
-		return blobstore.VersionPage{}, errors.New("wasabi: key is required")
+		return blobstore.VersionPage{}, errors.New(p.errPrefix() + "key is required")
 	}
 	in := &s3.ListObjectVersionsInput{
 		Bucket: aws.String(p.cfg.Bucket),
@@ -873,9 +964,12 @@ func (p *Provider) ListObjectVersions(ctx context.Context, req blobstore.ListVer
 	if req.Cursor != "" {
 		in.KeyMarker = aws.String(req.Cursor)
 	}
-	if req.MaxKeys > 0 {
-		in.MaxKeys = aws.Int32(req.MaxKeys)
+	// Cap MaxKeys at 1000 (S3 API maximum per page).
+	maxKeys := req.MaxKeys
+	if maxKeys <= 0 || maxKeys > 1000 {
+		maxKeys = 1000
 	}
+	in.MaxKeys = aws.Int32(maxKeys)
 	out, err := p.client.ListObjectVersions(ctx, in)
 	if err != nil {
 		return blobstore.VersionPage{}, p.classifyError(err, req.Key)
@@ -903,7 +997,7 @@ func (p *Provider) ListObjectVersions(ctx context.Context, req blobstore.ListVer
 // DeleteVersion removes a specific version.
 func (p *Provider) DeleteVersion(ctx context.Context, ref blobstore.VersionedObjectRef) error {
 	if ref.Key == "" {
-		return errors.New("wasabi: key is required")
+		return errors.New(p.errPrefix() + "key is required")
 	}
 	_, err := p.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket:    aws.String(p.cfg.Bucket),
@@ -972,11 +1066,34 @@ func (p *Provider) ListParts(ctx context.Context, upload blobstore.MultipartUplo
 	}, nil
 }
 
-// DeleteBatch removes a batch of versions.
+// DeleteBatch removes a batch of versions. S3 DeleteObjects API
+// accepts at most 1000 objects per request; larger batches are
+// chunked automatically.
 func (p *Provider) DeleteBatch(ctx context.Context, refs []blobstore.VersionedObjectRef) (blobstore.BatchDeleteResult, error) {
 	if len(refs) == 0 {
 		return blobstore.BatchDeleteResult{}, nil
 	}
+	const maxBatchSize = 1000
+	result := blobstore.BatchDeleteResult{}
+	for start := 0; start < len(refs); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(refs) {
+			end = len(refs)
+		}
+		chunk := refs[start:end]
+		pageResult, err := p.deleteBatchChunk(ctx, chunk)
+		if err != nil {
+			return result, err
+		}
+		result.Deleted = append(result.Deleted, pageResult.Deleted...)
+		result.Errors = append(result.Errors, pageResult.Errors...)
+	}
+	return result, nil
+}
+
+// deleteBatchChunk sends a single DeleteObjects request for up to
+// 1000 refs.
+func (p *Provider) deleteBatchChunk(ctx context.Context, refs []blobstore.VersionedObjectRef) (blobstore.BatchDeleteResult, error) {
 	objects := make([]s3types.ObjectIdentifier, 0, len(refs))
 	for _, ref := range refs {
 		objects = append(objects, s3types.ObjectIdentifier{
@@ -1020,19 +1137,19 @@ func (p *Provider) classifyError(err error, key string) error {
 	// subject to string-matching false positives.
 	var noSuchKey *s3types.NoSuchKey
 	if errors.As(err, &noSuchKey) {
-		return fmt.Errorf("wasabi: %w: key %q (%v)", blobstore.ErrNotFound, key, err)
+		return fmt.Errorf(p.errPrefix()+"%w: key %q (%v)", blobstore.ErrNotFound, key, err)
 	}
 	var noSuchBucket *s3types.NoSuchBucket
 	if errors.As(err, &noSuchBucket) {
-		return fmt.Errorf("wasabi: %w: bucket %q (%v)", blobstore.ErrNotFound, p.cfg.Bucket, err)
+		return fmt.Errorf(p.errPrefix()+"%w: bucket %q (%v)", blobstore.ErrNotFound, p.cfg.Bucket, err)
 	}
 	var noSuchUpload *s3types.NoSuchUpload
 	if errors.As(err, &noSuchUpload) {
-		return fmt.Errorf("wasabi: %w: upload for key %q (%v)", blobstore.ErrNotFound, key, err)
+		return fmt.Errorf(p.errPrefix()+"%w: upload for key %q (%v)", blobstore.ErrNotFound, key, err)
 	}
 	var notFound *s3types.NotFound
 	if errors.As(err, &notFound) {
-		return fmt.Errorf("wasabi: %w: key %q (%v)", blobstore.ErrNotFound, key, err)
+		return fmt.Errorf(p.errPrefix()+"%w: key %q (%v)", blobstore.ErrNotFound, key, err)
 	}
 	// Fall back to HTTP status code via smithy's ResponseError, which
 	// wraps the transport-level response. This catches S3-compatible
@@ -1041,11 +1158,11 @@ func (p *Provider) classifyError(err error, key string) error {
 	if errors.As(err, &respErr) {
 		switch respErr.HTTPStatusCode() {
 		case 404:
-			return fmt.Errorf("wasabi: %w: key %q (%v)", blobstore.ErrNotFound, key, err)
+			return fmt.Errorf(p.errPrefix()+"%w: key %q (%v)", blobstore.ErrNotFound, key, err)
 		case 412:
-			return fmt.Errorf("wasabi: %w: key %q (%v)", blobstore.ErrPreconditionFailed, key, err)
+			return fmt.Errorf(p.errPrefix()+"%w: key %q (%v)", blobstore.ErrPreconditionFailed, key, err)
 		case 503:
-			return fmt.Errorf("wasabi: %w: key %q (%v)", blobstore.ErrThrottled, key, err)
+			return fmt.Errorf(p.errPrefix()+"%w: key %q (%v)", blobstore.ErrThrottled, key, err)
 		}
 	}
 	// Object Lock / retention conflicts surface as typed errors on
@@ -1054,9 +1171,9 @@ func (p *Provider) classifyError(err error, key string) error {
 	// retention conflicts only.
 	msg := err.Error()
 	if strings.Contains(msg, "ObjectLock") || strings.Contains(strings.ToLower(msg), "retention") {
-		return fmt.Errorf("wasabi: %w: key %q (%v)", blobstore.ErrRetentionConflict, key, err)
+		return fmt.Errorf(p.errPrefix()+"%w: key %q (%v)", blobstore.ErrRetentionConflict, key, err)
 	}
-	return fmt.Errorf("wasabi: key %q: %w", key, err)
+	return fmt.Errorf(p.errPrefix()+"key %q: %w", key, err)
 }
 
 // isClientError returns true for errors that are expected client-side
@@ -1122,9 +1239,12 @@ func formatRange(r *blobstore.ByteRange) string {
 	return "bytes=" + strconv.FormatInt(r.Start, 10) + "-" + strconv.FormatInt(r.End, 10)
 }
 
-func computeWriteResultHash(bucket, key, versionID string, state blobstore.BucketVersioningState, size int64, sum string) string {
+func computeWriteResultHash(provider, bucket, key, versionID string, state blobstore.BucketVersioningState, size int64, sum string) string {
+	if provider == "" {
+		provider = "s3"
+	}
 	h := sha256.New()
-	fmt.Fprintf(h, "wasabi/v1\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s", bucket, key, versionID, state, size, sum)
+	fmt.Fprintf(h, "%s/v1\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s", provider, bucket, key, versionID, state, size, sum)
 	return hex.EncodeToString(h.Sum(nil))
 }
 

@@ -38,7 +38,8 @@ func (s *Store) CreateFolder(ctx context.Context, f Folder) error {
 }
 
 // ListFolders returns child folders of parentFolderID (or root folders
-// if parentFolderID is empty) for the given tenant.
+// if parentFolderID is empty) for the given tenant. Results are capped
+// at 1000 rows to prevent unbounded result sets.
 func (s *Store) ListFolders(ctx context.Context, tenantID, parentFolderID string) ([]Folder, error) {
 	q := `SELECT id, tenant_id, COALESCE(parent_folder_id, ''), name_encrypted, privacy_mode, created_at
 	      FROM folders WHERE tenant_id = $1 AND deleted_at IS NULL`
@@ -49,7 +50,7 @@ func (s *Store) ListFolders(ctx context.Context, tenantID, parentFolderID string
 		q += ` AND parent_folder_id = $2`
 		args = append(args, parentFolderID)
 	}
-	q += ` ORDER BY created_at`
+	q += ` ORDER BY created_at LIMIT 1000`
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -69,9 +70,14 @@ func (s *Store) ListFolders(ctx context.Context, tenantID, parentFolderID string
 
 // GetFolder fetches a folder by ID.
 func (s *Store) GetFolder(ctx context.Context, id string) (*Folder, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, COALESCE(parent_folder_id, ''), name_encrypted, privacy_mode, created_at
+	var row *sql.Row
+	if s.getFolder != nil {
+		row = s.getFolder.QueryRowContext(ctx, id)
+	} else {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT id, tenant_id, COALESCE(parent_folder_id, ''), name_encrypted, privacy_mode, created_at
 		 FROM folders WHERE id = $1 AND deleted_at IS NULL`, id)
+	}
 	var f Folder
 	if err := row.Scan(&f.ID, &f.TenantID, &f.ParentFolderID, &f.NameEncrypted, &f.PrivacyMode, &f.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -104,11 +110,13 @@ func (s *Store) CreateNode(ctx context.Context, n Node) error {
 	return err
 }
 
-// ListNodes returns files in a folder.
+// ListNodes returns files in a folder. Results are capped at 1000
+// rows to prevent unbounded result sets.
 func (s *Store) ListNodes(ctx context.Context, folderID, tenantID string) ([]Node, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, tenant_id, folder_id, name_encrypted, mime_type, created_at, updated_at
-		 FROM nodes WHERE folder_id = $1 AND tenant_id = $2 AND deleted_at IS NULL ORDER BY created_at`,
+		 FROM nodes WHERE folder_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		 ORDER BY created_at LIMIT 1000`,
 		folderID, tenantID)
 	if err != nil {
 		return nil, err
@@ -127,9 +135,14 @@ func (s *Store) ListNodes(ctx context.Context, folderID, tenantID string) ([]Nod
 
 // GetNode fetches a node by ID.
 func (s *Store) GetNode(ctx context.Context, id string) (*Node, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, folder_id, name_encrypted, mime_type, created_at, updated_at
+	var row *sql.Row
+	if s.getNode != nil {
+		row = s.getNode.QueryRowContext(ctx, id)
+	} else {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT id, tenant_id, folder_id, name_encrypted, mime_type, created_at, updated_at
 		 FROM nodes WHERE id = $1 AND deleted_at IS NULL`, id)
+	}
 	var n Node
 	if err := row.Scan(&n.ID, &n.TenantID, &n.FolderID, &n.NameEncrypted, &n.MimeType, &n.CreatedAt, &n.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -170,10 +183,15 @@ func (s *Store) CreateEncryptionDomain(ctx context.Context, d EncryptionDomain) 
 
 // GetEncryptionDomain fetches an encryption domain by ID.
 func (s *Store) GetEncryptionDomain(ctx context.Context, id, tenantID string) (*EncryptionDomain, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, COALESCE(folder_id, ''), privacy_mode, generation,
-		        prev_generation, prev_key_envelope, created_at, rotated_at
+	var row *sql.Row
+	if s.getEncryptionDomain != nil {
+		row = s.getEncryptionDomain.QueryRowContext(ctx, id, tenantID)
+	} else {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT id, tenant_id, COALESCE(folder_id, ''), privacy_mode, generation,
+			        prev_generation, prev_key_envelope, created_at, rotated_at
 		 FROM encryption_domains WHERE id = $1 AND tenant_id = $2`, id, tenantID)
+	}
 	var d EncryptionDomain
 	if err := row.Scan(&d.ID, &d.TenantID, &d.FolderID, &d.PrivacyMode, &d.Generation,
 		&d.PrevGeneration, &d.PrevKeyEnvelope, &d.CreatedAt, &d.RotatedAt); err != nil {
@@ -242,12 +260,14 @@ func (s *Store) CreateKeyEnvelope(ctx context.Context, e KeyEnvelope) error {
 	return err
 }
 
-// ListEnvelopesByDomain returns key envelopes for a domain.
+// ListEnvelopesByDomain returns key envelopes for a domain. Results
+// are capped at 1000 rows.
 func (s *Store) ListEnvelopesByDomain(ctx context.Context, domainID, tenantID string) ([]KeyEnvelope, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, COALESCE(domain_id, ''), COALESCE(version_id, ''), tenant_id, envelope_type,
 		        ciphertext, nonce, COALESCE(encapsulated_key, ''::bytea), metadata, created_at
-		 FROM key_envelopes WHERE domain_id = $1 AND tenant_id = $2 ORDER BY created_at`,
+		 FROM key_envelopes WHERE domain_id = $1 AND tenant_id = $2
+		 ORDER BY created_at LIMIT 1000`,
 		domainID, tenantID)
 	if err != nil {
 		return nil, err
@@ -319,12 +339,14 @@ func (s *Store) CreateShareGrant(ctx context.Context, g ShareGrant) error {
 	return err
 }
 
-// ListActiveShareGrants returns active grants for a grantee (tenant-scoped).
+// ListActiveShareGrants returns active grants for a grantee
+// (tenant-scoped). Results are capped at 1000 rows.
 func (s *Store) ListActiveShareGrants(ctx context.Context, granteeUserID, tenantID string) ([]ShareGrant, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, tenant_id, COALESCE(node_id, ''), grantor_user_id, grantee_user_id,
 		        generation, is_active, COALESCE(key_envelope_id, ''), created_at, revoked_at
-		 FROM share_grants WHERE grantee_user_id = $1 AND tenant_id = $2 AND is_active = true ORDER BY created_at DESC`,
+		 FROM share_grants WHERE grantee_user_id = $1 AND tenant_id = $2 AND is_active = true
+		 ORDER BY created_at DESC LIMIT 1000`,
 		granteeUserID, tenantID)
 	if err != nil {
 		return nil, err

@@ -8,7 +8,9 @@
 //
 // Phase 1 ships exactly two adapters:
 //   - local_fs_dev: dev/CI loopback (pkg/blobstore/local_fs_dev)
-//   - wasabi: the only production durable origin (pkg/blobstore/wasabi)
+//   - s3: production S3-compatible adapter (pkg/blobstore/s3)
+//     supports Wasabi, AWS S3, and Backblaze B2 via the provider
+//     config field.
 //
 // All layers above this package operate on ciphertext. Object keys
 // carry no tenant, user, group, file, or folder identifiers (§3

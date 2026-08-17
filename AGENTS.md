@@ -17,9 +17,9 @@ go test ./...
 - `cmd/drive-worker` — background jobs (promotion, repair, purge, backup, guardrail rollups).
 - `pkg/blobstore` — provider-agnostic `BlobStore` / `BlobInventory` interfaces.
 - `pkg/blobstore/local_fs_dev` — dev/CI filesystem adapter.
-- `pkg/blobstore/wasabi` — production Wasabi adapter (AWS SDK v2, S3-compatible).
+- `pkg/blobstore/s3` — production S3-compatible adapter (AWS SDK v2; supports Wasabi, AWS S3, Backblaze B2).
 - `pkg/hotcache` — L1 hot object cache interface + memory/disk implementations.
-- `pkg/wasabiguardrails` — Wasabi fair-use egress / min-storage / hit-ratio guardrails.
+- `pkg/storageguardrails` — per-provider fair-use egress / min-storage / hit-ratio guardrails.
 - `pkg/contracttest` — shared BlobStore conformance suite.
 - `internal/blobio` — L1+L2 write/read pipeline with singleflight L2 restore.
 - `internal/metadata` — Postgres metadata store (trimmed schema, outbox, erasure ledger).

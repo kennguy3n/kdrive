@@ -744,7 +744,13 @@ func (p *Provider) ListObjects(ctx context.Context, req blobstore.ListObjectsReq
 	}
 	sort.Slice(metas, func(i, j int) bool { return metas[i].Key < metas[j].Key })
 	max := int(req.MaxKeys)
-	if max <= 0 || max > len(metas) {
+	if max <= 0 {
+		max = 1000
+	}
+	if max > 1000 {
+		max = 1000
+	}
+	if max > len(metas) {
 		max = len(metas)
 	}
 	page := metas[:max]
@@ -879,7 +885,9 @@ func (p *Provider) ListParts(ctx context.Context, upload blobstore.MultipartUplo
 			continue
 		}
 		var partNum int32
-		fmt.Sscanf(name, "part-%05d", &partNum)
+		if _, err := fmt.Sscanf(name, "part-%05d", &partNum); err != nil {
+			continue
+		}
 		parts = append(parts, blobstore.CompletedPart{PartNumber: partNum, Size: info.Size()})
 	}
 	sort.Slice(parts, func(i, j int) bool { return parts[i].PartNumber < parts[j].PartNumber })

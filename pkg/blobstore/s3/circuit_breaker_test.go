@@ -1,4 +1,4 @@
-package wasabi
+package s3
 
 import (
 	"errors"

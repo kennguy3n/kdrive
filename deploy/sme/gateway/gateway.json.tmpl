@@ -2,12 +2,13 @@
   "env": "production",
   "http_addr": ":8080",
   "postgres_dsn": "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable",
-  "wasabi": {
-    "endpoint": "${WASABI_ENDPOINT}",
-    "region": "${WASABI_REGION}",
-    "bucket": "${WASABI_BUCKET}",
-    "access_key": "${WASABI_ACCESS_KEY}",
-    "secret_key": "${WASABI_SECRET_KEY}",
+  "storage": {
+    "provider": "${STORAGE_PROVIDER:-wasabi}",
+    "endpoint": "${STORAGE_ENDPOINT}",
+    "region": "${STORAGE_REGION}",
+    "bucket": "${STORAGE_BUCKET}",
+    "access_key": "${STORAGE_ACCESS_KEY}",
+    "secret_key": "${STORAGE_SECRET_KEY}",
     "use_path_style": true
   },
   "cache": {
@@ -15,6 +16,6 @@
     "disk_root_path": "/var/lib/kdrive/cache",
     "max_bytes": ${KDRIVE_CACHE_MAX_BYTES:-429496729600}
   },
-  "wasabi_circuit_breaker_enabled": ${KDRIVE_CIRCUIT_BREAKER_ENABLED:-false},
-  "wasabi_circuit_breaker_threshold": ${KDRIVE_CIRCUIT_BREAKER_THRESHOLD:-10}
+  "storage_circuit_breaker_enabled": ${KDRIVE_CIRCUIT_BREAKER_ENABLED:-false},
+  "storage_circuit_breaker_threshold": ${KDRIVE_CIRCUIT_BREAKER_THRESHOLD:-10}
 }

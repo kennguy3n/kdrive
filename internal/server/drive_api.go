@@ -38,13 +38,24 @@ type driveAPI struct {
 	// each gateway instance has its own session map.
 	sessions   map[string]*uploadSession
 	sessionsMu sync.RWMutex
+
+	// In-memory content dedup store (dev mode fallback when Postgres
+	// is not available). Moved from package-level vars to the struct so
+	// each gateway instance has its own dedup maps.
+	memContentStore    map[string]*memContentEntry  // content_id → entry
+	memContentChunks   map[string][]memContentChunk // content_id → chunks
+	memContentMu       sync.RWMutex
+	memContentStoreMax int // max entries before eviction
 }
 
 // newDriveAPI creates the Drive API handler.
 func newDriveAPI(gw *Gateway) *driveAPI {
 	return &driveAPI{
-		gw:       gw,
-		sessions: map[string]*uploadSession{},
+		gw:                 gw,
+		sessions:           map[string]*uploadSession{},
+		memContentStore:    map[string]*memContentEntry{},
+		memContentChunks:   map[string][]memContentChunk{},
+		memContentStoreMax: 10000,
 	}
 }
 
@@ -508,7 +519,10 @@ func (d *driveAPI) handleUploadChunks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var ordinal int
-	fmt.Sscanf(ordinalStr, "%d", &ordinal)
+	if _, err := fmt.Sscanf(ordinalStr, "%d", &ordinal); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid ordinal")
+		return
+	}
 
 	blobKey := fmt.Sprintf("blob_%s_%d", sid, ordinal)
 

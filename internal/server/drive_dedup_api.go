@@ -21,7 +21,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/kchat/drive/internal/metadata"
@@ -49,47 +48,55 @@ type memContentChunk struct {
 	CiphertextLen    int64
 }
 
-var (
-	memContentStore    = map[string]*memContentEntry{}  // content_id → entry
-	memContentChunks   = map[string][]memContentChunk{} // content_id → chunks
-	memContentMu       sync.RWMutex
-	memContentStoreMax = 10000 // max entries before eviction
-)
-
 // putMemContent inserts a content entry and its chunks into the in-memory
 // stores, evicting a random entry if the store has reached its size limit.
 // Caller must NOT hold memContentMu.
-func putMemContent(key string, entry *memContentEntry, chunks []memContentChunk) {
-	memContentMu.Lock()
-	defer memContentMu.Unlock()
-	if len(memContentStore) >= memContentStoreMax {
+//
+// NOTE: Eviction is currently random (map iteration order is randomized
+// in Go). A proper LRU would track access order, but that adds
+// complexity for a dev-mode fallback. Left as a known limitation.
+func (d *driveAPI) putMemContent(key string, entry *memContentEntry, chunks []memContentChunk) {
+	d.memContentMu.Lock()
+	defer d.memContentMu.Unlock()
+	if len(d.memContentStore) >= d.memContentStoreMax {
 		// Evict a random entry (map iteration order is randomized in Go).
-		for k := range memContentStore {
-			delete(memContentStore, k)
-			delete(memContentChunks, k)
+		for k := range d.memContentStore {
+			delete(d.memContentStore, k)
+			delete(d.memContentChunks, k)
 			break
 		}
 	}
-	memContentStore[key] = entry
-	memContentChunks[key] = chunks
+	// The chunks map can grow larger than the entry store because
+	// eviction above only trims to memContentStoreMax. Add a hard cap
+	// at 10x the store max (100000) and evict random entries to keep
+	// memory bounded in dev mode.
+	if d.memContentStoreMax > 0 && len(d.memContentChunks) > d.memContentStoreMax*10 {
+		for k := range d.memContentChunks {
+			delete(d.memContentChunks, k)
+			delete(d.memContentStore, k)
+			break
+		}
+	}
+	d.memContentStore[key] = entry
+	d.memContentChunks[key] = chunks
 }
 
 // getMemContent retrieves a content entry from the in-memory store.
 // Caller must NOT hold memContentMu. The returned entry is a snapshot;
 // callers should not mutate it.
-func getMemContent(key string) (*memContentEntry, bool) {
-	memContentMu.RLock()
-	defer memContentMu.RUnlock()
-	entry, ok := memContentStore[key]
+func (d *driveAPI) getMemContent(key string) (*memContentEntry, bool) {
+	d.memContentMu.RLock()
+	defer d.memContentMu.RUnlock()
+	entry, ok := d.memContentStore[key]
 	return entry, ok
 }
 
 // getMemContentChunks retrieves the chunks for a content entry from the
 // in-memory store. Caller must NOT hold memContentMu.
-func getMemContentChunks(key string) ([]memContentChunk, bool) {
-	memContentMu.RLock()
-	defer memContentMu.RUnlock()
-	chunks, ok := memContentChunks[key]
+func (d *driveAPI) getMemContentChunks(key string) ([]memContentChunk, bool) {
+	d.memContentMu.RLock()
+	defer d.memContentMu.RUnlock()
+	chunks, ok := d.memContentChunks[key]
 	return chunks, ok
 }
 
@@ -165,7 +172,7 @@ func (d *driveAPI) handleContentCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// In-memory fallback (dev mode)
-	entry, ok := getMemContent(body.ContentID)
+	entry, ok := d.getMemContent(body.ContentID)
 
 	if !ok || entry.TenantID != tenantID {
 		writeJSON(w, http.StatusOK, map[string]any{"exists": false})
@@ -235,9 +242,9 @@ func (d *driveAPI) handleContentCheckChunks(w http.ResponseWriter, r *http.Reque
 
 	// In-memory fallback (dev mode)
 	knownHashes := map[string]string{} // hash → blob_key
-	chunks, ok := getMemContentChunks(body.ContentID)
+	chunks, ok := d.getMemContentChunks(body.ContentID)
 	if ok {
-		entry, _ := getMemContent(body.ContentID)
+		entry, _ := d.getMemContent(body.ContentID)
 		if entry != nil && entry.TenantID == tenantID {
 			for _, c := range chunks {
 				knownHashes[c.ChunkContentHash] = c.BlobKey
@@ -368,7 +375,7 @@ func (d *driveAPI) handleContentRegister(w http.ResponseWriter, r *http.Request)
 	}
 
 	// In-memory fallback (dev mode)
-	if existing, ok := getMemContent(body.ContentID); ok {
+	if existing, ok := d.getMemContent(body.ContentID); ok {
 		if existing.TenantID != tenantID {
 			writeError(w, http.StatusForbidden, "content_id owned by another tenant")
 			return
@@ -396,7 +403,7 @@ func (d *driveAPI) handleContentRegister(w http.ResponseWriter, r *http.Request)
 		})
 	}
 
-	putMemContent(body.ContentID, &memContentEntry{
+	d.putMemContent(body.ContentID, &memContentEntry{
 		ContentID:        body.ContentID,
 		TenantID:         tenantID,
 		PlaintextSize:    body.PlaintextSize,
@@ -500,7 +507,7 @@ func (d *driveAPI) handleUploadCommitDedup(w http.ResponseWriter, r *http.Reques
 		_ = entry // entry verified to exist and belong to tenant
 	} else {
 		// In-memory fallback (dev mode)
-		entry, ok := getMemContent(body.ContentID)
+		entry, ok := d.getMemContent(body.ContentID)
 		if !ok || entry.TenantID != tenantID {
 			writeError(w, http.StatusBadRequest, "content_id not registered")
 			return

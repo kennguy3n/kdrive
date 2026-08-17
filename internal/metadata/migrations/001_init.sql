@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     privacy_mode    TEXT NOT NULL DEFAULT 'secured',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Guardrail configuration is stored as JSONB so the
-    -- wasabiguardrails.Guardrails struct can round-trip without a
+    -- storageguardrails.Guardrails struct can round-trip without a
     -- schema migration per tuning change.
     guardrails      JSONB NOT NULL DEFAULT '{}'::jsonb
 );

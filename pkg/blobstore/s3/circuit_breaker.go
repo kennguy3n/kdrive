@@ -1,4 +1,4 @@
-package wasabi
+package s3
 
 import (
 	"errors"
@@ -23,11 +23,11 @@ const (
 
 // ErrCircuitOpen is returned when the circuit breaker is open and
 // requests are being fail-fasted.
-var ErrCircuitOpen = errors.New("wasabi: circuit breaker open")
+var ErrCircuitOpen = errors.New("s3: circuit breaker open")
 
 // CircuitBreaker is a simple, dependency-free circuit breaker for the
-// Wasabi adapter. It wraps the S3API calls and fail-fasts when Wasabi
-// is consistently returning errors.
+// S3-compatible adapter. It wraps the S3API calls and fail-fasts when
+// the storage backend is consistently returning errors.
 //
 // The breaker counts consecutive failures (not a sliding window) so
 // a brief blip doesn't trip it, but a sustained outage does. Once

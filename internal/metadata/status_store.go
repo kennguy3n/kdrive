@@ -221,7 +221,7 @@ func (s *PostgresStatusStore) CountCachedPlacements(ctx context.Context) (int64,
 // provider-verified version ID and durable timestamp. This is a
 // targeted update used by the promote path after a successful PUT.
 func (s *PostgresStatusStore) MarkDurable(ctx context.Context, blobKey, blobVersionID string, size int64, checksum string, durableAt time.Time) error {
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE blob_placements
 		    SET commit_state    = 'COMMITTED_DURABLE',
 		        blob_version_id = $2,
@@ -233,6 +233,10 @@ func (s *PostgresStatusStore) MarkDurable(ctx context.Context, blobKey, blobVers
 		blobKey, nullString(blobVersionID), size, checksum, durableAt)
 	if err != nil {
 		return fmt.Errorf("metadata: mark durable: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
