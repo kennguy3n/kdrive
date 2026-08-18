@@ -67,21 +67,27 @@ func NewWithClock(root string, clock func() time.Time) (*Provider, error) {
 }
 
 // validateKey rejects keys that would escape the provider root via
-// path traversal. It also rejects separators, empty IDs, and relative
-// components. The gateway must only submit opaque, filesystem-safe IDs
-// so this is a defence-in-depth check.
+// path traversal. It allows forward-slash separators (mapping to
+// subdirectories, matching S3 key semantics) but rejects backslashes,
+// relative components, NUL bytes, and empty segments.
 func validateKey(key string) error {
 	if key == "" {
 		return errors.New("local_fs_dev: key is required")
 	}
-	if strings.ContainsAny(key, `/\`) {
-		return fmt.Errorf("local_fs_dev: key %q must not contain path separators", key)
-	}
-	if key == "." || key == ".." {
-		return fmt.Errorf("local_fs_dev: key %q must not be a relative path component", key)
+	if strings.ContainsRune(key, '\\') {
+		return fmt.Errorf("local_fs_dev: key %q must not contain backslashes", key)
 	}
 	if strings.ContainsRune(key, 0) {
 		return fmt.Errorf("local_fs_dev: key %q must not contain NUL bytes", key)
+	}
+	// Reject any segment that is a relative path component (prevents traversal).
+	for _, seg := range strings.Split(key, "/") {
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("local_fs_dev: key %q must not contain relative path components", key)
+		}
+		if seg == "" {
+			return fmt.Errorf("local_fs_dev: key %q must not contain empty path segments", key)
+		}
 	}
 	// Reject keys that collide with internal directories.
 	if key == "_multipart" {
