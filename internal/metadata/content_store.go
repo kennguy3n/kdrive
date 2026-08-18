@@ -181,26 +181,21 @@ func (s *Store) CreateContentChunks(ctx context.Context, contentID string, chunk
 // content_id (scoped to the tenant). Returns a result entry per input hash.
 // Uses ANY() to filter at the database level instead of loading all chunks.
 func (s *Store) CheckChunkHashes(ctx context.Context, contentID, tenantID string, hashes []string) ([]ChunkCheckResultEntry, error) {
-	// First verify the content entry belongs to this tenant.
-	_, err := s.GetContentEntry(ctx, contentID, tenantID)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			// Content not registered — no chunks exist.
-			results := make([]ChunkCheckResultEntry, len(hashes))
-			for i, h := range hashes {
-				results[i] = ChunkCheckResultEntry{Hash: h, Exists: false}
-			}
-			return results, nil
-		}
-		return nil, err
-	}
-
-	// Query only the hashes we're checking (uses the composite index).
+	// Chunk-level dedup searches across ALL content_chunks for this tenant,
+	// not just the given content_id. This allows a new file version to reuse
+	// chunks from a different content_id (e.g., chunk 1 is identical between
+	// two versions of a file but the overall content_id differs because the
+	// plaintext hash includes the modified chunk 2).
+	//
+	// The content_id parameter is retained for API compatibility but the
+	// query is scoped to tenant_id only.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT chunk_content_hash, blob_key
+		`SELECT DISTINCT chunk_content_hash, blob_key
 		 FROM content_chunks
-		 WHERE content_id = $1 AND chunk_content_hash = ANY($2)`,
-		contentID, pq.Array(hashes))
+		 WHERE content_id IN (
+		     SELECT content_id FROM content_entries WHERE tenant_id = $1
+		 ) AND chunk_content_hash = ANY($2)`,
+		tenantID, pq.Array(hashes))
 	if err != nil {
 		return nil, err
 	}

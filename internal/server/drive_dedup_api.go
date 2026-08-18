@@ -16,7 +16,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -24,7 +26,13 @@ import (
 	"time"
 
 	"github.com/kchat/drive/internal/metadata"
+	"github.com/kchat/drive/pkg/blobstore"
 )
+
+// hexDecodeString is a thin wrapper around hex.DecodeString for use in handlers.
+func hexDecodeString(s string) ([]byte, error) {
+	return hex.DecodeString(s)
+}
 
 // --- In-memory fallback (dev mode without Postgres) ---
 
@@ -241,16 +249,20 @@ func (d *driveAPI) handleContentCheckChunks(w http.ResponseWriter, r *http.Reque
 	}
 
 	// In-memory fallback (dev mode)
+	// Chunk-level dedup searches across ALL content chunks for this tenant,
+	// not just the given content_id. This allows a new file version to reuse
+	// chunks from a different content_id.
 	knownHashes := map[string]string{} // hash → blob_key
-	chunks, ok := d.getMemContentChunks(body.ContentID)
-	if ok {
-		entry, _ := d.getMemContent(body.ContentID)
-		if entry != nil && entry.TenantID == tenantID {
-			for _, c := range chunks {
-				knownHashes[c.ChunkContentHash] = c.BlobKey
-			}
+	d.memContentMu.RLock()
+	for cid, entry := range d.memContentStore {
+		if entry.TenantID != tenantID {
+			continue
+		}
+		for _, c := range d.memContentChunks[cid] {
+			knownHashes[c.ChunkContentHash] = c.BlobKey
 		}
 	}
+	d.memContentMu.RUnlock()
 
 	results := make([]map[string]any, 0, len(body.ChunkHashes))
 	for _, hash := range body.ChunkHashes {
@@ -539,5 +551,83 @@ func (d *driveAPI) handleUploadCommitDedup(w http.ResponseWriter, r *http.Reques
 		"committed":      true,
 		"deduped_chunks": len(body.ReusedBlobKeys),
 		"new_chunks":     len(body.NewBlobKeys),
+	})
+}
+
+// handleBlobUpload stores a single ciphertext blob under its blob_key.
+// This is used by the KDRV1 dedup upload flow (dedupUpload NAPI callback).
+//
+//	POST /v1/blobs:upload
+//	Body: { blob_key, ciphertext_hex, ciphertext_sha256, plaintext_len, ciphertext_len }
+func (d *driveAPI) handleBlobUpload(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	_, tenantID := getUserTenant(r)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Demo-Tenant header")
+		return
+	}
+
+	var body struct {
+		BlobKey          string `json:"blob_key"`
+		CiphertextHex    string `json:"ciphertext_hex"`
+		CiphertextSHA256 string `json:"ciphertext_sha256"`
+		PlaintextLen     int64  `json:"plaintext_len"`
+		CiphertextLen    int64  `json:"ciphertext_len"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if body.BlobKey == "" || body.CiphertextHex == "" {
+		writeError(w, http.StatusBadRequest, "missing blob_key or ciphertext_hex")
+		return
+	}
+
+	// Decode ciphertext
+	ctBytes, err := hexDecodeString(body.CiphertextHex)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid ciphertext_hex")
+		return
+	}
+
+	// Store ciphertext in the blob store
+	if d.gw.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		putReq := blobstore.PutRequest{
+			Key:            body.BlobKey,
+			Body:           bytes.NewReader(ctBytes),
+			ExpectedLength: int64(len(ctBytes)),
+			ContentType:    "application/octet-stream",
+		}
+		// Only set checksum if provided (dev store may not validate it)
+		if body.CiphertextSHA256 != "" {
+			putReq.ChecksumSHA256 = body.CiphertextSHA256
+		}
+		_, err := d.gw.store.Put(ctx, putReq)
+		if err != nil {
+			d.gw.logger.Error("drive: blob upload", slog.Any("err", err))
+			writeError(w, http.StatusInternalServerError, "failed to store blob")
+			return
+		}
+	}
+
+	d.gw.logger.Info("drive: blob uploaded",
+		slog.String("blob_key", body.BlobKey),
+		slog.Int("ciphertext_len", len(ctBytes)),
+	)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"blob_key":       body.BlobKey,
+		"stored":         true,
+		"ciphertext_len": len(ctBytes),
 	})
 }

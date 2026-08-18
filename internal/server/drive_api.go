@@ -77,6 +77,7 @@ func (d *driveAPI) registerDriveRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/content:check", d.handleContentCheck)
 	mux.HandleFunc("/v1/content:checkChunks", d.handleContentCheckChunks)
 	mux.HandleFunc("/v1/content:register", d.handleContentRegister)
+	mux.HandleFunc("/v1/blobs:upload", d.handleBlobUpload)
 }
 
 // --- CORS middleware ---
