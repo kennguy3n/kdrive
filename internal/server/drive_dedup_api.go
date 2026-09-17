@@ -537,6 +537,26 @@ func (d *driveAPI) handleUploadCommitDedup(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// Verify new blob keys were actually uploaded to the blob store.
+	// Without this check a client could commit a version whose chunks
+	// were never persisted, leaving the content undownloadable.
+	if d.gw.store != nil && len(body.NewBlobKeys) > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		for _, k := range body.NewBlobKeys {
+			_, err := d.gw.store.Head(ctx, blobstore.ObjectRef{Key: k})
+			if err != nil {
+				if errors.Is(err, blobstore.ErrNotFound) {
+					writeError(w, http.StatusBadRequest, "new blob key not uploaded: "+k)
+					return
+				}
+				d.gw.logger.Error("drive: commit dedup blob head", slog.Any("err", err))
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+		}
+	}
+
 	versionID := generateID("version")
 
 	d.gw.logger.Info("drive: committed KDRV1 version",
